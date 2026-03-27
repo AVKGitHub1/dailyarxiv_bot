@@ -1,0 +1,138 @@
+Jun Ye
+Adam Kaufman
+Jeff Thompson
+Peter Zoller
+Monika Schleier-Smith
+Mikhail Lukin
+Soonwon Choi
+John Preskill
+Jian-wei Pan
+Norman Yao
+Ben Bloom (Atom Computing)
+Christopher Monroe
+Tom Killian
+Antoine Browaeys
+Jon Simon
+Frank Arute (Google)
+Sergio Boixo (Google)
+Hannes Bernien
+David Weiss
+Mark Saffman
+Bryce Gadway
+Brian Neyenhuis (Honeywell)
+Kang-Kuen Ni
+John Doyle
+Dan Stamper-Kurn
+Waseem Bakr
+Peter Schauss
+Immanuel Bloch
+Markus Greiner
+Manuel Endres
+Hannes Pichler
+Ish Dhand (Xanadu)
+Jungsang Kim (IonQ)
+Arman Zaribafiyan (1QBit)
+Oskar Painter
+Fernando Brandao
+Jacob Covey
+Alexandre Cooper
+Monika Aidelsburger
+Vladan Vuletic
+Nicholas Hutzler
+Sebastian Blatt
+Naomi Nickerson (PsiQuantum)
+Mihir Pant (PsiQuantum)
+Cindy Regal
+Rainer Blatt
+Marianna Safronova
+Andrea Morello
+Jason Petta
+Garnet Chan
+Marcello Benedetti (Cambridge Quantum)
+Loic Henriet (Pasqal)
+Loïc Henriet (Pasqal)
+Tilman Pfau
+Michel Brune
+Francesca Ferlaino
+Wolfgang Ketterle
+Klaus Mølmer
+Klaus Molmer
+Leticia Tarruell
+Hans Buchler
+Hans Büchler
+Jaewook Ahn
+Matthias Troyer
+John Martinis
+Ciaran Ryan-Anderson (Quantinuum)
+Ignacio Cirac
+Selim Jochim
+Tai Hyun Yoon
+Wesley Campbell
+Jonathan Simon
+David Schuster
+Scott Aaronson
+Dmitry Abanin
+Pedram Roushan
+Joonhee Choi
+Alexei Kitaev
+Ivan Deutsch
+Sylvain De Léséleuc
+Yoshiro Takahashi
+Kenji Ohmori
+Eric Hudson
+Andrei Derevianko
+Peter Thirolf
+Ana Maria Rey
+Craig Gidney
+Ran Finkelstein
+Johannes Zeiher
+Tanya Zelevinsky
+Sebastian Will
+Ana Asenjo Garcia
+Giulia Semeghini
+Susanne Yelin
+Harry Levine
+Aziza Suleymanzade
+Ivana Dimitrova
+Kevin Singh
+Matthew Shaw
+Matthew Norcia
+Aishwarya Kumar
+Pai Peng
+Nathan Schine
+Huanqian Loh
+Florian Schreck
+Jiazhong Hu
+Leandro Aolita
+Tobias Haug
+Daniel Gottesman
+Jonathan Hood
+Boris Korzh
+Stefan Kuhr
+Grant Biedermann
+Vladan Vuletić
+Shruti Puri
+Charles Brown
+Wenlan Chen
+Hui Zhai
+Jean-Philippe Brantut
+Leonardo Fallani
+Giacomo Cappellini
+Michael Foss-feig
+Steven Girvin
+Gerhard Rempe
+Gerhard Birkl
+Hsin-Yuan Huang
+Sergey Bravyi
+Michel Devoret
+Guido Pupillo
+Julio Barreiro
+Holger Müller
+Travis Nicholson
+Abhinav Kandala (IBM)
+Alexey Gorshkov
+Alp Sipahigil
+Hengyun Zhou
+Adam Shaw
+Zeyang Li
+Aishwarya Kumar
