@@ -1,5 +1,4 @@
-from slackarxiv_simon import main_ret_message, main_slack_one_time_send
-import datetime
+from slackbot_daily_arxiv import main_ret_message
 
 FILEPATH = "test_results.txt"
 

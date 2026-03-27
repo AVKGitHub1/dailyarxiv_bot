@@ -9,9 +9,13 @@ import yaml
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
 
+#setup logging
+import logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+
 CONFIG_PATH = Path(__file__).with_name("config.yml")
-
-
 def load_config(path=CONFIG_PATH):
     with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
@@ -40,8 +44,12 @@ SUBCAT = CONFIG["subcat"]
 
 
 def load_lines(path):
-    with open(path, "r") as f:
-        return f.read().split("\n")
+    try:
+        with open(path, "r") as f:
+            return f.read().split("\n")
+    except Exception as e:
+        logger.exception("Error reading lines from %s: %s", path, e)
+        return []
 
 
 def load_watchlists():
@@ -205,7 +213,7 @@ def post_to_slack(slack_client, msg_text):
     except SlackApiError as e:
         assert e.response["ok"] is False
         assert e.response["error"]
-        print(f"Got an error: {e.response['error']}")
+        logger.exception("Error posting to Slack: %s", e.response["error"])
 
     
 def main_ret_message():
@@ -224,7 +232,7 @@ def main_ret_message():
     try:
         df = fetch_papers_for_date(date_str)
     except Exception as ex:
-        raise Exception("Something wrong with data download", ex)
+        logger.exception("Error fetching papers for date %s: %s", date_str, ex)
 
     imp_author_idx, imp_keyword_idx, _other_idx, which_authors = classify_papers(
         df,
