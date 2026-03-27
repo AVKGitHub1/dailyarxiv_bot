@@ -78,6 +78,5 @@ npm-debug.log
 *.o
 *.a
 *.lib
-bot_server.py
 config.yml
 test_results.txt

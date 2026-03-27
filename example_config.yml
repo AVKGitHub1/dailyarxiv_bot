@@ -1,0 +1,19 @@
+slack_token: ""
+channel: ""
+cols:
+  - id
+  - title
+  - categories
+  - abstract
+  - doi
+  - created
+  - updated
+  - authors
+categories:
+  - physics
+  - physics
+  - physics:cond-mat
+subcat:
+  - [physics.atom-ph]
+  - [quant-ph]
+  - [physics:cond-mat.quant-gas]
