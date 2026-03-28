@@ -11,7 +11,8 @@ NEAR_TIME_POLL_SECONDS = 30
 RETRY_DELAY_SECONDS = 60
 SECONDS_PER_DAY = 24 * 60 * 60
 
-logging.basicConfig(level=logging.INFO)
+# setup logging with date and time in the format YYYY-MM-DD HH:MM:SS
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 
