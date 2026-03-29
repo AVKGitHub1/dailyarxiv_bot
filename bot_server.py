@@ -6,8 +6,6 @@ import slackbot_daily_arxiv as bot
 
 TIMES = ["21:30"]  # Times to send messages (24-hour format)
 SEND_WINDOW_SECONDS = 10 * 60
-FAR_AWAY_THRESHOLD_SECONDS = 30 * 60
-NEAR_TIME_POLL_SECONDS = 30
 RETRY_DELAY_SECONDS = 60
 SECONDS_PER_DAY = 24 * 60 * 60
 ALLOWED_WEEKDAYS = {6, 0, 1, 2, 3}  # Sunday(6) through Thursday(3)
@@ -34,27 +32,48 @@ def seconds_since_midnight(now):
     return now.hour * 3600 + now.minute * 60 + now.second
 
 
-def circular_time_distance_seconds(a, b):
-    raw_diff = abs(a - b)
-    return min(raw_diff, SECONDS_PER_DAY - raw_diff)
-
-
 def get_next_send_index(now, sent_today):
     now_seconds = seconds_since_midnight(now)
     for idx, scheduled_seconds in enumerate(SCHEDULE_SECONDS):
         if sent_today[idx]:
             continue
-        if circular_time_distance_seconds(now_seconds, scheduled_seconds) < SEND_WINDOW_SECONDS:
+        due_end = min(SECONDS_PER_DAY, scheduled_seconds + SEND_WINDOW_SECONDS)
+        if scheduled_seconds <= now_seconds < due_end:
             return idx
     return None
 
 
-def nearest_schedule_distance(now):
-    now_seconds = seconds_since_midnight(now)
-    return min(
-        circular_time_distance_seconds(now_seconds, scheduled_seconds)
-        for scheduled_seconds in SCHEDULE_SECONDS
-    )
+def schedule_seconds_to_time(scheduled_seconds):
+    hour = scheduled_seconds // 3600
+    minute = (scheduled_seconds % 3600) // 60
+    second = scheduled_seconds % 60
+    return datetime.time(hour=hour, minute=minute, second=second)
+
+
+def get_next_send_datetime(now, sent_today):
+    for day_offset in range(0, 8):
+        candidate_date = (now + datetime.timedelta(days=day_offset)).date()
+        if not is_allowed_run_day(candidate_date):
+            continue
+
+        day_candidates = []
+        for idx, scheduled_seconds in enumerate(SCHEDULE_SECONDS):
+            if day_offset == 0 and sent_today[idx]:
+                continue
+
+            candidate_dt = datetime.datetime.combine(
+                candidate_date,
+                schedule_seconds_to_time(scheduled_seconds),
+            )
+            if day_offset == 0 and candidate_dt <= now:
+                continue
+
+            day_candidates.append(candidate_dt)
+
+        if day_candidates:
+            return min(day_candidates)
+
+    return None
 
 
 def is_allowed_run_day(current_date):
@@ -81,17 +100,11 @@ def run_scheduler():
             sent_today = [False] * len(SCHEDULE_SECONDS)
             logger.info("New day detected. Reset daily send flags for %s.", active_date.isoformat())
 
-        if not is_allowed_run_day(now.date()):
-            sleep_seconds = seconds_until_next_allowed_day(now)
-            logger.info(
-                "Skipping sends on %s. Bot runs only Sun-Thu. Sleeping for %s seconds.",
-                now.strftime("%A"),
-                sleep_seconds,
-            )
-            time.sleep(sleep_seconds)
-            continue
+        if is_allowed_run_day(now.date()):
+            send_idx = get_next_send_index(now, sent_today)
+        else:
+            send_idx = None
 
-        send_idx = get_next_send_index(now, sent_today)
         if send_idx is not None:
             try:
                 bot.main_slack_send()
@@ -102,20 +115,24 @@ def run_scheduler():
                 time.sleep(RETRY_DELAY_SECONDS)
                 continue
 
-            time.sleep(SEND_WINDOW_SECONDS)
             continue
 
-        distance = nearest_schedule_distance(now)
-        if distance > FAR_AWAY_THRESHOLD_SECONDS:
-            sleep_seconds = max(1, distance - SEND_WINDOW_SECONDS)
+        next_send_dt = get_next_send_datetime(now, sent_today)
+        if next_send_dt is not None:
+            sleep_seconds = max(1, int((next_send_dt - now).total_seconds()))
             logger.info(
-                "No sends due soon. Sleeping for %s seconds (nearest slot in %s seconds).",
+                "No sends due now. Sleeping for %s seconds (next slot at %s).",
                 sleep_seconds,
-                distance,
+                next_send_dt.strftime("%Y-%m-%d %H:%M:%S"),
             )
             time.sleep(sleep_seconds)
         else:
-            time.sleep(NEAR_TIME_POLL_SECONDS)
+            sleep_seconds = seconds_until_next_allowed_day(now)
+            logger.info(
+                "No future slot found from current schedule. Sleeping for %s seconds.",
+                sleep_seconds,
+            )
+            time.sleep(sleep_seconds)
 
 
 if __name__ == "__main__":
