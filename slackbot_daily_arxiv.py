@@ -226,7 +226,7 @@ def main_ret_message():
         keywords_lower,
     ) = load_watchlists()
 
-    tomorrow_date = datetime.date.today()
+    tomorrow_date = datetime.date.today() + datetime.timedelta(days=1)
     date_str = tomorrow_date.strftime("%Y-%m-%d")
 
     try:
