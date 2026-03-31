@@ -21,7 +21,7 @@ def save_msg(result):
         f.write(result)
 
 def main():
-    date_diff = int(sys.argv[1]) if len(sys.argv)>1 else 0
+    date_diff = int(sys.argv[1]) if len(sys.argv)>1 else None
     message = get_test_message(date_diff=date_diff)
     if message:
         print(f"Message retrieved successfully. Saved to {FILEPATH}.")

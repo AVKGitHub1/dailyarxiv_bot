@@ -247,7 +247,7 @@ def main_ret_message(date_diff=None):
     msg_text = build_message(date_str, df, imp_author_idx, imp_keyword_idx, which_authors)
     return msg_text
 
-def main_slack_send():
+def main_slack_send(date_diff=None):
     slackclient = WebClient(token=SLACK_TOKEN)
-    msg_text = main_ret_message()
+    msg_text = main_ret_message(date_diff=date_diff)
     post_to_slack(slackclient, msg_text)
