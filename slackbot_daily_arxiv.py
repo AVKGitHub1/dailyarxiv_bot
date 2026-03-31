@@ -216,7 +216,7 @@ def post_to_slack(slack_client, msg_text):
         logger.exception("Error posting to Slack: %s", e.response["error"])
 
     
-def main_ret_message():
+def main_ret_message(date_diff=None):
     (
         important_people,
         _important_firsts,
@@ -226,7 +226,10 @@ def main_ret_message():
         keywords_lower,
     ) = load_watchlists()
 
-    tomorrow_date = datetime.date.today() + datetime.timedelta(days=1)
+    if date_diff is not None:
+        tomorrow_date = datetime.date.today() + datetime.timedelta(days=date_diff)
+    else:
+        tomorrow_date = datetime.date.today() + datetime.timedelta(days=1)
     date_str = tomorrow_date.strftime("%Y-%m-%d")
 
     try:
