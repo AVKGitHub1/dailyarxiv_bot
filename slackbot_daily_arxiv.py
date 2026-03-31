@@ -167,6 +167,8 @@ def classify_papers(
 
 
 def format_authors(authors):
+    if len(authors) > 10:
+        return "_MANY AUTHORS_"
     cap_authors = [
         " ".join([name.capitalize() for name in author.split()]) for author in authors
     ]

@@ -11,9 +11,11 @@ cols:
   - authors
 categories:
   - physics
+  - quant-ph
+  - cond-mat
   - physics
-  - physics:cond-mat
 subcat:
   - [physics.atom-ph]
-  - [quant-ph]
-  - [physics:cond-mat.quant-gas]
+  - []
+  - [cond-mat.quant-gas]
+  - [physics.optics]
