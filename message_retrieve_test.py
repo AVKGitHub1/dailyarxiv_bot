@@ -25,7 +25,7 @@ def main():
     message = get_test_message(date_diff=date_diff)
     if message:
         print(f"Message retrieved successfully. Saved to {FILEPATH}.")
-        save_msg("Retrieved Message:\n" + message)
+        save_msg("Message:\n" + message[0] + "\nThread Message:\n" + message[1])
     else:
         print("Failed to retrieve message.")
 

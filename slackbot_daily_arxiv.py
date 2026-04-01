@@ -174,6 +174,29 @@ def format_authors(authors):
     ]
     return ", ".join(cap_authors)
 
+def normalize_abstract_text(text):
+    return " ".join(str(text).split())
+
+
+def to_sentence_case(text):
+    normalized = normalize_abstract_text(text)
+    if not normalized:
+        return normalized
+    try:
+        chars = list(normalized)
+        capitalize_next = True
+        for i, ch in enumerate(chars):
+            if capitalize_next and ch.isalpha():
+                chars[i] = ch.upper()
+                capitalize_next = False
+            if ch in ".!?":
+                capitalize_next = True
+    except Exception as e:
+        logger.exception("Error converting text to sentence case: %s", e)
+        return normalized
+
+    return "".join(chars)
+
 
 def build_message(date, df, imp_author_idx, imp_keyword_idx, which_authors):
     lines = []
@@ -209,16 +232,21 @@ def build_message(date, df, imp_author_idx, imp_keyword_idx, which_authors):
     return "\n".join(lines)
 
 
-def post_to_slack(slack_client, msg_text):
-    try:
-        slack_client.chat_postMessage(channel=CHANNEL, text=msg_text)
-    except SlackApiError as e:
-        assert e.response["ok"] is False
-        assert e.response["error"]
-        logger.exception("Error posting to Slack: %s", e.response["error"])
+def build_abstract_thread_message(date, df, imp_author_idx, imp_keyword_idx):
+    selected_idx = imp_author_idx + imp_keyword_idx
+    if not selected_idx:
+        return None
 
-    
-def main_ret_message(date_diff=None):
+    lines = [f"*Abstracts for {date}*:", "-----------------------", ""]
+    for idx in selected_idx:
+        lines.append("*Title:* " + df.title[idx].capitalize())
+        lines.append("*Link:* " + "www.arxiv.org/abs/" + df.id[idx])
+        lines.append("*Abstract:* " + to_sentence_case(df.abstract[idx]))
+        lines.append("")
+    return "\n".join(lines)
+
+
+def build_daily_payload(date_diff=None):
     (
         important_people,
         _important_firsts,
@@ -238,6 +266,7 @@ def main_ret_message(date_diff=None):
         df = fetch_papers_for_date(date_str)
     except Exception as ex:
         logger.exception("Error fetching papers for date %s: %s", date_str, ex)
+        raise
 
     imp_author_idx, imp_keyword_idx, _other_idx, which_authors = classify_papers(
         df,
@@ -247,9 +276,46 @@ def main_ret_message(date_diff=None):
         keywords_lower,
     )
     msg_text = build_message(date_str, df, imp_author_idx, imp_keyword_idx, which_authors)
-    return msg_text
+
+    thread_text = build_abstract_thread_message(
+        date_str, df, imp_author_idx, imp_keyword_idx)
+
+    return {
+        "date_str": date_str,
+        "df": df,
+        "imp_author_idx": imp_author_idx,
+        "imp_keyword_idx": imp_keyword_idx,
+        "which_authors": which_authors,
+        "msg_text": msg_text,
+        "thread_text": thread_text,
+    }
+
+
+def post_to_slack(slack_client, msg_text, thread_ts=None):
+    try:
+        response = slack_client.chat_postMessage(
+            channel=CHANNEL,
+            text=msg_text,
+            thread_ts=thread_ts,
+        )
+        return response
+    except SlackApiError as e:
+        assert e.response["ok"] is False
+        assert e.response["error"]
+        logger.exception("Error posting to Slack: %s", e.response["error"])
+        return None
+
+    
+def main_ret_message(date_diff=None):
+    payload = build_daily_payload(date_diff=date_diff)
+    return payload["msg_text"], payload["thread_text"]
 
 def main_slack_send(date_diff=None):
     slackclient = WebClient(token=SLACK_TOKEN)
-    msg_text = main_ret_message(date_diff=date_diff)
-    post_to_slack(slackclient, msg_text)
+    msg_txt, thread_text = main_ret_message(date_diff=date_diff)
+    parent_response = post_to_slack(slackclient, msg_txt)
+    if parent_response is None:
+        return
+
+    if thread_text:
+        post_to_slack(slackclient, thread_text, thread_ts=parent_response["ts"])
