@@ -1,0 +1,2 @@
+{% extends "base.html" %}
+{% block content %}<section class="panel login-panel"><h1>{{ error.code }} {{ error.name }}</h1><p>{{ error.description }}</p><a class="button" href="{{ url_for('index') }}">Back to Daily arXiv</a></section>{% endblock %}

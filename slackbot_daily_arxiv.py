@@ -1,9 +1,10 @@
 import datetime
-import sys
+import os
+import re
 from pathlib import Path
 from time import sleep
 
-import arxivscraper
+import arxiv_source as arxivscraper
 import pandas as pd
 import yaml
 from slack_sdk import WebClient
@@ -14,9 +15,14 @@ import logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+MAX_DISPLAY_AUTHORS = 15
 
-CONFIG_PATH = Path(__file__).with_name("config.yml")
-def load_config(path=CONFIG_PATH):
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.yml"
+
+
+def load_config(path=None):
+    path = path or os.environ.get("ARXIV_CONFIG", CONFIG_PATH)
     with open(path, "r", encoding="utf-8") as f:
         config = yaml.safe_load(f) or {}
 
@@ -35,28 +41,25 @@ def load_config(path=CONFIG_PATH):
     return config
 
 
-CONFIG = load_config()
-SLACK_TOKEN = CONFIG["slack_token"]
-CHANNEL = CONFIG["channel"]
-COLS = tuple(CONFIG["cols"])
-CATEGORIES = CONFIG["categories"]
-SUBCAT = CONFIG["subcat"]
-
-
 def load_lines(path):
     try:
-        with open(path, "r") as f:
-            return f.read().split("\n")
+        with open(path, "r", encoding="utf-8-sig") as f:
+            return [line.strip() for line in f if line.strip()]
     except Exception as e:
         logger.exception("Error reading lines from %s: %s", path, e)
         return []
 
 
-def load_watchlists():
-    important_people = load_lines("important_people.txt")
-    important_firsts = [name.split()[0] for name in important_people]
-    important_lasts = [name.split()[1] for name in important_people]
-    keywords = load_lines("keywords.txt")
+def load_watchlists(important_people=None, keywords=None):
+    if important_people is None:
+        important_people = load_lines(BASE_DIR / "important_people.txt")
+    if keywords is None:
+        keywords = load_lines(BASE_DIR / "keywords.txt")
+    important_people = [name.strip() for name in important_people if name.strip()]
+    keywords = [kw.strip() for kw in keywords if kw.strip()]
+    names = [re.sub(r"\s*\([^)]*\)", "", name).split() for name in important_people]
+    important_firsts = [name[0] for name in names]
+    important_lasts = [name[-1] for name in names]
     keywords_lower = [kw.lower() for kw in keywords]
     important_firsts_lower = [first.lower() for first in important_firsts]
     important_lasts_lower = [last.lower() for last in important_lasts]
@@ -71,11 +74,10 @@ def load_watchlists():
     )
 
 
-def fetch_papers_for_date(date_str):
+def fetch_papers_for_date(date_str, config=None):
+    config = config if config is not None else load_config()
     frames = []
-    for cat_idx in range(len(CATEGORIES)):
-        category = CATEGORIES[cat_idx]
-        subcategories = SUBCAT[cat_idx]
+    for category, subcategories in zip(config["categories"], config["subcat"]):
         if not subcategories:
             scraper = arxivscraper.Scraper(
                 category=category,
@@ -93,18 +95,22 @@ def fetch_papers_for_date(date_str):
             )
 
         output = scraper.scrape()
-        frames.append(pd.DataFrame(output, columns=COLS))
-        sleep(1)
+        if not isinstance(output, list):
+            raise RuntimeError("arXiv returned an invalid response; please try again later.")
+        frames.append(pd.DataFrame(output, columns=config["cols"]))
+        sleep(3)
 
     if frames:
         df = pd.concat(frames, ignore_index=True)
     else:
-        df = pd.DataFrame([], columns=COLS)
+        df = pd.DataFrame([], columns=config["cols"])
 
-    return df.drop_duplicates(subset="id").reset_index()
+    return df.drop_duplicates(subset="id").reset_index(drop=True)
 
 
 def match_author(first_name, last_name, important_firsts, important_lasts):
+    if not first_name:
+        return None
     for ii, important_last in enumerate(important_lasts):
         if last_name != important_last:
             continue
@@ -131,7 +137,7 @@ def classify_papers(
     which_authors = [""] * num_retrieved
 
     for paper_id in range(num_retrieved):
-        authors = df.authors[paper_id]
+        authors = [name for name in df.authors[paper_id] if name.split()]
         first_names = [name.split()[0].lower() for name in authors]
         last_names = [name.split()[-1].lower() for name in authors]
 
@@ -167,8 +173,8 @@ def classify_papers(
 
 
 def format_authors(authors):
-    if len(authors) > 10:
-        return "_MANY AUTHORS_"
+    if len(authors) > MAX_DISPLAY_AUTHORS:
+        return "MANY AUTHORS"
     cap_authors = [
         " ".join([name.capitalize() for name in author.split()]) for author in authors
     ]
@@ -246,7 +252,7 @@ def build_abstract_thread_message(date, df, imp_author_idx, imp_keyword_idx):
     return "\n".join(lines)
 
 
-def build_daily_payload(date_diff=None):
+def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_date=None):
     (
         important_people,
         _important_firsts,
@@ -254,16 +260,18 @@ def build_daily_payload(date_diff=None):
         important_firsts_lower,
         important_lasts_lower,
         keywords_lower,
-    ) = load_watchlists()
+    ) = load_watchlists(*(watchlists or (None, None)))
 
-    if date_diff is not None:
+    if target_date is not None:
+        tomorrow_date = datetime.date.fromisoformat(target_date)
+    elif date_diff is not None:
         tomorrow_date = datetime.date.today() + datetime.timedelta(days=date_diff)
     else:
         tomorrow_date = datetime.date.today() + datetime.timedelta(days=1)
     date_str = tomorrow_date.strftime("%Y-%m-%d")
 
     try:
-        df = fetch_papers_for_date(date_str)
+        df = fetch_papers_for_date(date_str, config=config)
     except Exception as ex:
         logger.exception("Error fetching papers for date %s: %s", date_str, ex)
         raise
@@ -288,13 +296,36 @@ def build_daily_payload(date_diff=None):
         "which_authors": which_authors,
         "msg_text": msg_text,
         "thread_text": thread_text,
+        "papers": [
+            {
+                "id": str(df.id[idx]),
+                "title": normalize_abstract_text(df.title[idx]),
+                "abstract": normalize_abstract_text(df.abstract[idx]),
+                "authors": list(df.authors[idx]),
+                "selection": "author" if idx in imp_author_idx else "keyword",
+                "selected_for": which_authors[idx].rstrip(", "),
+            }
+            for idx in imp_author_idx + imp_keyword_idx
+        ],
     }
 
 
-def post_to_slack(slack_client, msg_text, thread_ts=None):
+def payload_from_papers(date_str, papers):
+    """Format an already reviewed selection without fetching arXiv again."""
+    df = pd.DataFrame(papers)
+    author_idx = [idx for idx, paper in enumerate(papers) if paper["selection"] == "author"]
+    keyword_idx = [idx for idx, paper in enumerate(papers) if paper["selection"] != "author"]
+    which_authors = [paper.get("selected_for", "") + ", " for paper in papers]
+    return {
+        "msg_text": build_message(date_str, df, author_idx, keyword_idx, which_authors),
+        "thread_text": build_abstract_thread_message(date_str, df, author_idx, keyword_idx),
+    }
+
+
+def post_to_slack(slack_client, msg_text, thread_ts=None, *, channel=None):
     try:
         response = slack_client.chat_postMessage(
-            channel=CHANNEL,
+            channel=channel if channel is not None else load_config()["channel"],
             text=msg_text,
             thread_ts=thread_ts,
         )
@@ -303,7 +334,7 @@ def post_to_slack(slack_client, msg_text, thread_ts=None):
         assert e.response["ok"] is False
         assert e.response["error"]
         logger.exception("Error posting to Slack: %s", e.response["error"])
-        return None
+        raise
 
     
 def main_ret_message(date_diff=None):
@@ -311,11 +342,10 @@ def main_ret_message(date_diff=None):
     return payload["msg_text"], payload["thread_text"]
 
 def main_slack_send(date_diff=None):
-    slackclient = WebClient(token=SLACK_TOKEN)
-    msg_txt, thread_text = main_ret_message(date_diff=date_diff)
-    parent_response = post_to_slack(slackclient, msg_txt)
-    if parent_response is None:
-        return
+    config = load_config()
+    slackclient = WebClient(token=config["slack_token"], timeout=30)
+    payload = build_daily_payload(date_diff=date_diff, config=config)
+    parent_response = post_to_slack(slackclient, payload["msg_text"], channel=config["channel"])
 
-    if thread_text:
-        post_to_slack(slackclient, thread_text, thread_ts=parent_response["ts"])
+    if payload["thread_text"]:
+        post_to_slack(slackclient, payload["thread_text"], thread_ts=parent_response["ts"], channel=config["channel"])

@@ -1,0 +1,31 @@
+services:
+  arxiv-bot:
+    build: .
+    init: true
+    restart: unless-stopped
+    ports:
+      - "0.0.0.0:8765:8765"
+    environment:
+      TZ: America/Los_Angeles
+      SCHEDULER_ENABLED: "1"
+    volumes:
+      - type: bind
+        source: ./config.yml
+        target: /app/config.yml
+        read_only: true
+        bind:
+          create_host_path: false
+      - arxiv-data:/data
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    stop_grace_period: 45s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  arxiv-data:

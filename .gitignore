@@ -59,6 +59,9 @@ coverage.xml
 
 # Environment
 .env
+.env.*
+!.env.example
+!.env.sample
 .venv
 env/
 venv/
@@ -78,5 +81,43 @@ npm-debug.log
 *.o
 *.a
 *.lib
+
+# Local configuration and credentials
 config.yml
+config.yaml
+config.local.*
+config.*.local
+config.*.local.yml
+config.*.local.yaml
+compose.override.yml
+compose.override.yaml
+docker-compose.override.yml
+docker-compose.override.yaml
+secrets/
+.secrets/
+*secret*.json
+*secret*.yml
+*secret*.yaml
+*credential*.json
+*credential*.yml
+*credential*.yaml
+*service-account*.json
+*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+id_rsa
+id_ed25519
+
+# Local state, output, and machine-specific launchers
 test_results.txt
+data/
+*.db
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.log
+playwright-report/
+run_bot.vbs

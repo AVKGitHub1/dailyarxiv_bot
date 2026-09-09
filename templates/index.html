@@ -1,0 +1,92 @@
+{% extends "base.html" %}
+{% macro paper_list(papers, preview_mode=false) %}
+  <div class="paper-list">
+  {% for paper in papers %}
+    <article class="paper">
+      <div class="paper-meta"><span>{{ 'Author match' if paper.selection == 'author' else 'Keyword match' }}</span>{% if preview_mode %}<span class="pill {{ 'new' if paper.id in new_ids else '' }}">{{ 'New' if paper.id in new_ids else 'In previous list' }}</span>{% endif %}</div>
+      <details>
+        <summary>{{ paper.title }}<span class="expand" aria-hidden="true">+</span></summary>
+        <div class="abstract"><h4>Abstract</h4><p>{{ paper.abstract }}</p></div>
+      </details>
+      <p class="paper-authors">{{ paper.authors | paper_authors }}</p>
+      {% if paper.selected_for %}<p class="selection">Selected for {{ paper.selected_for }}</p>{% endif %}
+      <a class="arxiv-link" href="https://arxiv.org/abs/{{ paper.id | urlencode }}" target="_blank" rel="noopener noreferrer">arXiv:{{ paper.id }} <span aria-hidden="true">↗</span></a>
+    </article>
+  {% endfor %}
+  </div>
+{% endmacro %}
+{% block content %}
+  {% set running = job and job.status == 'running' %}
+  {% if is_admin and job %}<div class="notice {{ job.status }}" role="status" data-job-running="{{ 'true' if running else 'false' }}">{% if running %}<span class="spinner" aria-hidden="true"></span>{% endif %}{{ job.message }}{% if running %}<small>This page updates when the job finishes.</small>{% endif %}</div>{% endif %}
+
+  <div class="dashboard">
+    <div class="digest-column">
+      <section class="panel digest">
+        <div class="section-heading"><h2>Last message</h2><span class="count">{{ last_message.papers | length if last_message else 0 }} papers</span></div>
+        {% if last_message %}
+          <p class="section-note">Papers for {{ last_message.date }} · Sent {{ last_message.sent_at | local_time }}</p>
+          <p class="hint">Click a title to read its abstract.</p>
+          {{ paper_list(last_message.papers) }}
+        {% else %}
+          <div class="empty-state"><span aria-hidden="true">↗</span><h3>Your next reading list starts here.</h3><p>No message has been sent from this dashboard yet. Papers will appear here after a successful Slack delivery.</p></div>
+        {% endif %}
+      </section>
+
+      <section class="panel preview" id="preview">
+        <div class="section-heading"><h2>Current preview</h2><span class="count">{{ new_ids | length }} new</span></div>
+        {% if is_admin %}
+          <p class="section-note">Regenerate refreshes this list. Send posts only papers absent from the list used for the previous successful send.</p>
+          <div class="actions">
+            <form method="post" action="{{ url_for('regenerate') }}" class="regenerate-form">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <label for="paper-date">Paper date</label>
+              <div class="input-action"><input id="paper-date" type="date" name="date" value="{{ preview.date if preview else default_date }}" required><button class="button secondary" type="submit" {% if running %}disabled{% endif %}>↻ Regenerate</button></div>
+            </form>
+            <form method="post" action="{{ url_for('send') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+              <input type="hidden" name="preview_id" value="{{ preview.id if preview else '' }}">
+              <button class="button" type="submit" {% if running or not new_ids %}disabled{% endif %}>Send {{ new_ids | length }} new {{ 'paper' if new_ids | length == 1 else 'papers' }} ↗</button>
+            </form>
+          </div>
+        {% endif %}
+        {% if preview %}
+          {% if preview.papers %}<p class="hint">Click a title to read its abstract.</p>{% endif %}
+          <p class="hint">Papers for {{ preview.date }} · Generated {{ preview.generated_at | local_time }}</p>
+          {% if preview.papers %}{{ paper_list(preview.papers, true) }}{% else %}<div class="empty-state compact"><h3>No matching papers for this date.</h3><p>Try a different date or suggest an addition to the watchlists.</p></div>{% endif %}
+        {% else %}
+          <div class="empty-state compact"><h3>Ready when you are.</h3><p>An admin can regenerate a preview at any time. Automatic delivery uses the following day’s paper date.</p></div>
+        {% endif %}
+      </section>
+    </div>
+
+    <aside class="watchlist-column">
+      <section class="panel watchlists">
+        <h2>Watchlists</h2>
+        <p class="section-note">Papers match an author, or a keyword in their title or abstract.</p>
+        <p class="section-note">Suggestions join the watchlist after admin approval.</p>
+        {% for kind, label, values, placeholder in [('authors', 'Authors', authors, 'e.g. Ada Lovelace'), ('keywords', 'Keywords', keywords, 'e.g. quantum simulation')] %}
+          <div class="watchlist">
+            <div class="list-heading"><label for="{{ kind }}-list">{{ label }}</label><span>{{ values | length }}</span></div>
+            <textarea id="{{ kind }}-list" readonly rows="{{ 7 if kind == 'authors' else 5 }}" spellcheck="false">{{ values | join('\n') }}</textarea>
+            <form method="post" action="{{ url_for('suggest') }}">
+              <input type="hidden" name="csrf_token" value="{{ csrf_token }}"><input type="hidden" name="kind" value="{{ kind }}">
+              <label class="suggest-label" for="{{ kind }}-suggestion">Suggest {{ 'an author' if kind == 'authors' else 'a keyword' }}</label>
+              <div class="input-action"><input id="{{ kind }}-suggestion" name="value" type="text" maxlength="160" placeholder="{{ placeholder }}" required><button class="button secondary" type="submit" aria-label="Submit {{ kind }} suggestion">Add</button></div>
+            </form>
+          </div>
+        {% endfor %}
+      </section>
+
+      {% if is_admin %}
+      <section class="panel review">
+        <div class="section-heading"><h2>Suggestions</h2><span class="count">{{ suggestions | length }}</span></div>
+        {% for item in suggestions %}
+          <div class="suggestion"><small>{{ 'Author' if item.kind == 'authors' else 'Keyword' }}</small><p>{{ item.value }}</p>
+            <form method="post" action="{{ url_for('review', suggestion_id=item.id) }}"><input type="hidden" name="csrf_token" value="{{ csrf_token }}"><button class="button small" type="submit" name="decision" value="accept">Accept</button><button class="text-button" type="submit" name="decision" value="reject">Dismiss</button></form>
+          </div>
+        {% else %}<p class="section-note">All caught up. New suggestions will appear here.</p>{% endfor %}
+      </section>
+      {% endif %}
+    </aside>
+  </div>
+{% endblock %}

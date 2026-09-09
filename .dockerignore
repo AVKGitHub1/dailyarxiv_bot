@@ -1,0 +1,16 @@
+# Allow only application inputs into the build context. In particular, never
+# include the local Slack token, database, logs, Git metadata, or virtualenv.
+**
+!requirements.txt
+!slackbot_daily_arxiv.py
+!bot_server.py
+!web_app.py
+!web_state.py
+!digest_service.py
+!arxiv_source.py
+!important_people.txt
+!keywords.txt
+!templates/
+!templates/**
+!static/
+!static/**
