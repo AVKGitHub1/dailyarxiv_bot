@@ -3,9 +3,12 @@ import datetime
 import io
 import tempfile
 import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 import pandas as pd
 from werkzeug.security import generate_password_hash
@@ -212,12 +215,146 @@ class AppCase(unittest.TestCase):
         self.assertEqual(new_papers(state), [])
         self.assertIn("2026-09-08 21:30", state["schedule_slots"])
 
-    def test_empty_scheduled_result_posts_nothing_and_preserves_last_message(self):
+    def test_empty_scheduled_result_posts_the_quiet_day_notice_and_preserves_state(self):
+        old = {"date": "2026-09-08", "sent_at": "2026-09-08T00:00:00+00:00", "papers": [paper("2609.00001")]}
+        self.store.update(lambda state: state.update(last_message=old, baseline_ids=["2609.00001"]))
         with patch.object(bot, "build_daily_payload", return_value={"date_str": "2026-09-09", "papers": []}), patch.object(bot, "post_to_slack") as send:
             self.service.start("scheduled", target_date="2026-09-09", slot="2026-09-08 21:30")
             self.wait_job()
-        send.assert_not_called()
+        self.assertEqual(send.call_count, 1)
+        self.assertEqual(send.call_args.args[1], bot.payload_from_papers("2026-09-09", [])["msg_text"])
+        self.assertIsNone(send.call_args.kwargs.get("thread_ts"))
+        state = self.store.read()
+        self.assertEqual(state["job"]["status"], "success")
+        self.assertIn("2026-09-08 21:30", state["schedule_slots"])
+        # A quiet day must not blank the dashboard or shrink the comparison list.
+        self.assertEqual(state["last_message"], old)
+        self.assertEqual(state["baseline_ids"], ["2609.00001"])
+
+    def test_quiet_notice_says_already_sent_when_every_match_was_delivered(self):
+        papers = [paper("2609.00001"), paper("2609.00002")]
+        self.store.update(lambda state: state.update(baseline_ids=["2609.00001", "2609.00002"]))
+        with patch.object(bot, "build_daily_payload", return_value={"date_str": "2026-09-09", "papers": papers}),                 patch.object(bot, "post_to_slack") as send:
+            self.service.start("scheduled", target_date="2026-09-09", slot="2026-09-08 21:30")
+            self.wait_job()
+        self.assertEqual(send.call_count, 1)
+        posted = send.call_args.args[1]
+        # The heartbeat still lands, but it must not claim nothing was found.
+        self.assertIn("*Papers for 2026-09-09*", posted)
+        self.assertIn("All 2 matching papers were already sent earlier today.", posted)
+        self.assertNotIn("No papers found", posted)
         self.assertIn("2026-09-08 21:30", self.store.read()["schedule_slots"])
+
+    def test_config_is_reread_for_every_regenerate_and_send(self):
+        loads = []
+        rotated = {**CONFIG, "channel": "#moved-channel", "slack_token": "rotated-token",
+                   "categories": ["physics"], "subcat": [["quant-ph"]]}
+
+        def loader():
+            loads.append(True)
+            return rotated
+
+        self.service.config_loader = loader
+        self.preview([paper("2609.00001")])
+        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send,                 patch.object(bot, "make_slack_client") as client:
+            self.service.start("send", preview_id="preview-1")
+            self.wait_job()
+        self.assertEqual(len(loads), 1)
+        self.assertEqual(send.call_args_list[0].kwargs["channel"], "#moved-channel")
+        client.assert_called_with("rotated-token")
+
+        # Regenerate re-reads too, so edited categories/subcat apply without a restart.
+        with patch.object(bot, "build_daily_payload", return_value={"date_str": "2026-09-09", "papers": []}) as build:
+            self.service.start("regenerate", target_date="2026-09-09")
+            self.wait_job()
+        self.assertEqual(len(loads), 2)
+        self.assertEqual(build.call_args.kwargs["config"], rotated)
+
+    def test_a_broken_config_edit_falls_back_to_the_last_valid_one(self):
+        def loader():
+            raise KeyError("Missing required config keys: ['channel']")
+
+        self.service.config_loader = loader
+        self.preview([paper("2609.00001")])
+        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send,                 self.assertLogs("digest_service", level="ERROR"):
+            self.service.start("send", preview_id="preview-1")
+            self.wait_job()
+        state = self.store.read()
+        self.assertEqual(state["job"]["status"], "success")
+        self.assertEqual(send.call_args_list[0].kwargs["channel"], CONFIG["channel"])
+
+    def test_an_injected_config_is_never_reloaded_from_disk(self):
+        self.assertIsNone(self.service.config_loader)
+
+    def test_manual_send_with_no_new_papers_is_rejected_before_posting(self):
+        self.preview([paper("2609.00001")])
+        self.store.update(lambda state: state.update(baseline_ids=["2609.00001"]))
+        with patch.object(bot, "post_to_slack") as send:
+            with self.assertRaises(ValueError) as caught:
+                self.service.start("send", preview_id="preview-1")
+        self.assertEqual(str(caught.exception), "There are no new papers to send.")
+        send.assert_not_called()
+
+    def test_oversized_digest_is_chunked_and_the_thread_hangs_off_the_first_chunk(self):
+        papers = []
+        for number in range(40):
+            long_paper = paper(f"2609.{number:05d}")
+            long_paper["title"] = " ".join(f"word{index}" for index in range(200))
+            papers.append(long_paper)
+        self.preview(papers)
+        expected = bot.payload_from_papers("2026-09-09", papers)
+        self.assertGreater(len(expected["msg_text"]), 39000)
+        parent_chunks = list(slack_chunks(expected["msg_text"]))
+        self.assertGreater(len(parent_chunks), 1)
+
+        posted = []
+
+        def record(client, text, thread_ts=None, *, channel=None):
+            posted.append((text, thread_ts))
+            return {"ts": f"123.{len(posted)}"}
+
+        with patch.object(bot, "post_to_slack", side_effect=record):
+            self.service.start("send", preview_id="preview-1")
+            self.wait_job()
+        top_level = [text for text, thread_ts in posted if thread_ts is None]
+        threaded = [thread_ts for _text, thread_ts in posted if thread_ts is not None]
+        self.assertEqual(top_level, parent_chunks)
+        self.assertTrue(threaded)
+        self.assertEqual(set(threaded), {"123.1"})
+        state = self.store.read()
+        self.assertEqual(state["job"]["status"], "success")
+        self.assertTrue(state["last_message"]["abstracts_sent"])
+
+    def test_continuation_failure_is_partial_and_never_reposts_the_parent(self):
+        papers = []
+        for number in range(40):
+            long_paper = paper(f"2609.{number:05d}")
+            long_paper["title"] = " ".join(f"word{index}" for index in range(200))
+            papers.append(long_paper)
+        self.preview(papers)
+        with patch.object(bot, "post_to_slack", side_effect=[{"ts": "123.1"}, RuntimeError("rate limited")]) as send,                 self.assertLogs("digest_service", level="ERROR"):
+            self.service.start("send", preview_id="preview-1")
+            self.wait_job()
+        self.assertEqual(send.call_count, 2)
+        state = self.store.read()
+        self.assertEqual(state["job"]["status"], "partial")
+        self.assertIn("title list", state["job"]["message"])
+        self.assertEqual(len(state["last_message"]["papers"]), len(papers))
+        self.assertEqual(new_papers(state), [])
+        # The retry cannot reach _send at all, so the parent is never posted twice.
+        with patch.object(bot, "post_to_slack") as resend:
+            with self.assertRaises(ValueError):
+                self.service.start("send", preview_id="preview-1")
+        resend.assert_not_called()
+
+    def test_scheduler_health_reports_a_stalled_loop_as_unhealthy(self):
+        self.assertFalse(self.service.scheduler_healthy())
+        self.service.scheduler = Mock(is_alive=Mock(return_value=True))
+        self.service.last_tick = time.monotonic()
+        self.assertTrue(self.service.scheduler_healthy())
+        self.service.last_tick = time.monotonic() - 121
+        self.assertFalse(self.service.scheduler_healthy())
+        self.service.scheduler = None
 
     def test_concurrent_jobs_are_rejected_and_fetch_errors_preserve_preview(self):
         self.preview([paper("2609.00001")])
@@ -302,6 +439,11 @@ class CoreTests(unittest.TestCase):
         sixteen = fifteen + ["Author 15"]
         self.assertNotEqual(bot.format_authors(fifteen), "MANY AUTHORS")
         self.assertEqual(bot.format_authors(sixteen), "MANY AUTHORS")
+
+    def test_slack_client_retries_rate_limits(self):
+        client = bot.make_slack_client("test-token")
+        self.assertTrue(any(isinstance(handler, RateLimitErrorRetryHandler)
+                            for handler in client.retry_handlers))
 
     def test_arxiv_invalid_response_is_not_treated_as_an_empty_success(self):
         config = {**CONFIG, "categories": ["physics"], "subcat": [[]]}

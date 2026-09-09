@@ -1,5 +1,6 @@
 import datetime
 import logging
+import os
 import time
 
 import slackbot_daily_arxiv as bot
@@ -136,4 +137,12 @@ def run_scheduler():
 
 
 if __name__ == "__main__":
+    # Pre-Docker entry point. web_app.py owns Slack delivery now; running both
+    # posts two digests a night to the same channel.
+    if os.environ.get("ARXIV_LEGACY_SCHEDULER") != "1":
+        raise SystemExit(
+            "bot_server.py is the pre-Docker scheduler. The container (web_app.py) now owns "
+            "Slack delivery; running both double-posts to the same channel. "
+            "Set ARXIV_LEGACY_SCHEDULER=1 to override."
+        )
     run_scheduler()

@@ -41,6 +41,8 @@ class RateLimiter:
 
 
 def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=False):
+    # Only re-read the file we loaded ourselves; an injected config stays fixed.
+    config_loader = bot.load_config if config is None else None
     config = config if config is not None else bot.load_config()
     store = StateStore(data_dir or os.environ.get("ARXIV_DATA_DIR", BASE_DIR / "data"), seed_dir or BASE_DIR)
     app = Flask(__name__)
@@ -52,7 +54,7 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
         SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
         PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=8),
     )
-    service = DigestService(store, config, os.environ.get("TZ", "America/Los_Angeles"))
+    service = DigestService(store, config, os.environ.get("TZ", "America/Los_Angeles"), config_loader=config_loader)
     app.extensions["store"] = store
     app.extensions["digest_service"] = service
     limiter = RateLimiter()
@@ -192,7 +194,7 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
     @app.get("/healthz")
     def health():
         store.read()
-        if start_scheduler and not service.scheduler.is_alive():
+        if start_scheduler and not service.scheduler_healthy():
             return jsonify(status="scheduler stopped"), 503
         return jsonify(status="ok")
 

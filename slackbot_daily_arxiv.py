@@ -9,6 +9,7 @@ import pandas as pd
 import yaml
 from slack_sdk import WebClient
 from slack_sdk.errors import SlackApiError
+from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 #setup logging
 import logging
@@ -19,6 +20,13 @@ MAX_DISPLAY_AUTHORS = 15
 
 BASE_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = BASE_DIR / "config.yml"
+
+
+def make_slack_client(token):
+    """One client configuration for every sender, so no path silently diverges."""
+    client = WebClient(token=token, timeout=30)
+    client.retry_handlers.append(RateLimitErrorRetryHandler(max_retry_count=3))
+    return client
 
 
 def load_config(path=None):
@@ -343,7 +351,7 @@ def main_ret_message(date_diff=None):
 
 def main_slack_send(date_diff=None):
     config = load_config()
-    slackclient = WebClient(token=config["slack_token"], timeout=30)
+    slackclient = make_slack_client(config["slack_token"])
     payload = build_daily_payload(date_diff=date_diff, config=config)
     parent_response = post_to_slack(slackclient, payload["msg_text"], channel=config["channel"])
 

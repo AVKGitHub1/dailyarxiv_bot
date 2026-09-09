@@ -10,7 +10,7 @@ This bot:
 - Flags papers as important if they match people in `important_people.txt` or terms in `keywords.txt`.
 - Posts a formatted digest to a Slack channel.
 - Can run once or on a daily schedule.
-- Runs in Docker with a public dashboard and password-protected admin controls.
+- Runs in Docker with a public dashboard and password-protected admin controls. The container is the supported way to run the schedule; `bot_server.py` and `run_bot_example.vbs` are the pre-Docker host runners kept for reference.
 
 ## Docker dashboard
 
@@ -26,6 +26,8 @@ docker info
 A missing `dockerDesktopLinuxEngine` pipe means the Linux engine is not running yet. Starting Docker Desktop is separate from restarting Windows. In Docker Desktop **Settings → General**, enable **Start Docker Desktop when you sign in to your computer** to bring the scheduled bot back after login. The container's `restart: unless-stopped` policy takes effect once Docker is running.
 
 Keep your existing `config.yml` for the same Slack token, channel, and category settings. For a fresh checkout, copy `example_config.yml` to `config.yml` and fill in the token and channel. The config is mounted read-only; it is excluded from the image and build context.
+
+`config.yml` is re-read at the start of every regeneration and every send, as the original host script did, so a rotated token, a moved channel, or edited categories take effect on the next run without restarting the container. If an edit leaves the file invalid, the error is logged and that run continues on the last valid configuration rather than going silent — check `docker compose logs` after editing.
 
 From this project directory:
 
@@ -61,11 +63,19 @@ There is no import of messages sent by the old standalone scripts. Until the fir
 
 ### Preserved schedule
 
-The container uses the existing schedule from `bot_server.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. Empty results produce no Slack post and leave the last message unchanged. The original ten-minute send window and one-minute retry delay are preserved; missed slots outside that window are not backfilled.
+The container uses the existing schedule from `bot_server.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. The original ten-minute send window and one-minute retry delay are preserved; missed slots outside that window are not backfilled.
 
-The web server and scheduler share one process and serialize their jobs. Completed schedule slots persist through restarts. Run one container for a given data volume, and stop the old `bot_server.py`/VBS scheduler before switching to the container to avoid two independent senders.
+A scheduled run with nothing to send still posts a notice, matching the original host script, so a quiet channel always means the bot is broken rather than idle. When nothing matched at all, the notice is the original `No papers found with specified authors! / ...keywords!` text. When papers matched but had all been delivered by an earlier send that day, the notice says so instead, rather than falsely claiming nothing was found. Neither notice changes **Last message** or the comparison list. A manual **Send** with no new papers posts nothing and reports "There are no new papers to send."
 
-The digest still groups author matches before keyword matches and posts abstracts as Slack thread replies. Large abstract threads are split into smaller replies. A failed parent post leaves the comparison list unchanged. If a parent succeeds but a thread reply fails, the message is recorded as delivered and the dashboard reports the partial failure, so retrying does not duplicate the parent.
+The web server and scheduler share one process and serialize their jobs. Completed schedule slots persist through restarts. Run one container for a given data volume, and keep the old `bot_server.py`/VBS scheduler stopped; both read the same `channel` from the same `config.yml`, so running both posts two digests a night and the container's deduplication cannot see the host's sends.
+
+The digest still groups author matches before keyword matches and posts abstracts as Slack thread replies. A digest too long for one Slack message is split across several top-level messages, and the abstract thread hangs off the first of them; large abstract threads are likewise split into smaller replies. A failed parent post leaves the comparison list unchanged. If the parent succeeds but a continuation message or a thread reply fails, the message is recorded as delivered and the dashboard reports the partial failure, so retrying does not duplicate the parent. The Slack client retries rate-limited requests up to three times.
+
+### Scheduler health
+
+`GET /healthz` returns 503 when the scheduler thread is dead **or** when its loop has not ticked in 120 seconds. If the loop exits unexpectedly, the process sends itself `SIGTERM` and shuts down cleanly, so Compose's `restart: unless-stopped` brings it back.
+
+An `autoheal` sidecar could also restart the container on a *hung but alive* loop, but it requires mounting `/var/run/docker.sock`, which grants a third-party image host-root-equivalent access. **That sidecar was deliberately not added.** A stall therefore surfaces in `/healthz` and needs a manual `docker compose restart arxiv-bot`.
 
 ### Persistence and maintenance
 
@@ -119,13 +129,13 @@ This uses installed Microsoft Edge by default and checks public suggestions, adm
 ## Repository contents
 
 - `slackbot_daily_arxiv.py`: Core logic for loading config, scraping arXiv, classifying papers, and building/posting the Slack message.
-- `bot_server.py`: Scheduler loop that sends at one or more daily times.
+- `bot_server.py`: **Legacy (pre-Docker)** host scheduler loop that sends at one or more daily times. The container owns Slack delivery now; the file remains because `digest_service.py` imports its schedule constants. Running it directly requires `ARXIV_LEGACY_SCHEDULER=1`.
 - `example_config.yml`: Template config for Slack + arXiv query settings.
 - `important_people.txt`: One person per line for author-based prioritization.
 - `keywords.txt`: One keyword/phrase per line for keyword-based prioritization.
 - `message_retrieve_test.py`: Generates the digest and writes it to `test_results.txt` without posting to Slack.
 - `slack_bot_test.py`: Sends the digest immediately to Slack.
-- `run_bot.vbs`: Optional Windows script for launching the scheduler in the background.
+- `run_bot.vbs` / `run_bot_example.vbs`: **Legacy (pre-Docker)** Windows scripts for launching `bot_server.py` in the background. They post to the same channel as the container.
 
 ## Requirements
 
@@ -178,11 +188,16 @@ Output is written to `test_results.txt`.
 python slack_bot_test.py
 ```
 
-### Run scheduled daily sender
+### Run scheduled daily sender (legacy, pre-Docker)
+
+Use the Docker dashboard instead. `bot_server.py` targets the **same channel** as the container, so running both double-posts every night. The entry point refuses to start unless you opt in:
 
 ```powershell
+$env:ARXIV_LEGACY_SCHEDULER = "1"
 python bot_server.py
 ```
+
+Before enabling it, confirm the container's scheduler is off (`SCHEDULER_ENABLED=0`, or the container stopped). Conversely, before the first scheduled slot after cutting over to Docker, remove any host registration of this script - check the Windows startup folder for the VBS and Task Scheduler for a task invoking `bot_server.py`.
 
 Edit schedule times in `bot_server.py`:
 
@@ -196,9 +211,9 @@ Notes:
 - The scheduler uses a send window to avoid missing a slot if the process wakes a little late.
 - Daily send flags reset automatically when the local date changes.
 
-### Windows background launch (optional)
+### Windows background launch (legacy, pre-Docker)
 
-`run_bot_example.vbs` launches the scheduler silently. Update to the correct paths.
+`run_bot_example.vbs` launches `bot_server.py` silently. Update to the correct paths. It carries the same double-post caveat as above and needs `ARXIV_LEGACY_SCHEDULER=1` in its environment.
 
 ## Message structure
 
