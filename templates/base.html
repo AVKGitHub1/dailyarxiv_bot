@@ -5,13 +5,15 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta name="theme-color" content="#193c3b">
   <title>{% block title %}Daily arXiv{% endblock %}</title>
+  <link rel="icon" href="{{ url_for('static', filename='favicon.ico') }}" sizes="16x16 32x32 48x48">
+  <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
   <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
   <script src="{{ url_for('static', filename='app.js') }}" defer></script>
 </head>
 <body>
   <header class="site-header">
     <div class="header-primary">
-      <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark" aria-hidden="true">a<span>χ</span></span><span>Daily arXiv</span></a>
+      <a class="brand" href="{{ url_for('index') }}"><span class="brand-mark" aria-hidden="true">DA</span><span>Daily arXiv</span></a>
       <div class="schedule"><span class="status-dot"></span><div>{{ 'Daily delivery' if scheduler_enabled else 'Schedule paused' }}<small>{{ schedule }} · Sun–Thu<br>{{ timezone_name }}</small></div></div>
     </div>
     <nav aria-label="Account">

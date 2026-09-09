@@ -103,13 +103,10 @@ h4 {
   width:42px;
   height:42px;
   background:var(--ink);
-  color:#f4edda;
+  color:var(--white);
   border-radius:12px;
-  font:25px Georgia,serif;
-}
-.brand-mark span {
-  font-size:19px;
-  margin-top:8px;
+  font:700 20px Georgia,serif;
+  letter-spacing:.5px;
 }
 nav,nav form {
   display:flex;
@@ -555,6 +552,7 @@ footer {
   .brand-mark {
     width:36px;
     height:36px;
+    font-size:17px;
   }
   nav {
     gap:10px;

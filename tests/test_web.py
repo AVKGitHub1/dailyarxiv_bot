@@ -245,6 +245,19 @@ class AppCase(unittest.TestCase):
         self.assertNotIn("No papers found", posted)
         self.assertIn("2026-09-08 21:30", self.store.read()["schedule_slots"])
 
+    def test_favicons_are_served_at_the_root_and_are_cacheable(self):
+        root = self.client.get("/favicon.ico")
+        self.assertEqual(root.status_code, 200)
+        self.assertEqual(root.data[:4], bytes([0, 0, 1, 0]))  # ICONDIR: reserved, type=icon
+        # Icons are exempt from the no-store rule the rest of the app uses.
+        self.assertNotEqual(root.headers.get("Cache-Control"), "no-store")
+        self.assertEqual(root.data, self.client.get("/static/favicon.ico").data)
+        self.assertEqual(self.client.get("/static/favicon.svg").status_code, 200)
+        for page in ("/", "/login"):
+            markup = self.client.get(page).data
+            self.assertIn(b'rel="icon"', markup)
+            self.assertIn(b"favicon.svg", markup)
+
     def test_config_is_reread_for_every_regenerate_and_send(self):
         loads = []
         rotated = {**CONFIG, "channel": "#moved-channel", "slack_token": "rotated-token",

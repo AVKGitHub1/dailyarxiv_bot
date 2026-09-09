@@ -126,6 +126,8 @@ The unit/integration suite mocks Slack and arXiv. An optional real-browser check
 
 This uses installed Microsoft Edge by default and checks public suggestions, admin approval, regeneration, sending only new papers, abstracts, and desktop/mobile layout. Screenshots are saved under `data/`. On another platform, install Chromium with `python -m playwright install chromium` and set `BROWSER_CHANNEL` to an empty string, or use another installed Playwright browser channel.
 
+The browser tab icon is `static/favicon.svg`; `static/favicon.ico` is generated from it for browsers that do not render SVG icons. After editing the SVG, regenerate and commit both with `python scripts/make_favicon_ico.py` (needs `playwright`, which the application itself never imports).
+
 ## Repository contents
 
 - `slackbot_daily_arxiv.py`: Core logic for loading config, scraping arXiv, classifying papers, and building/posting the Slack message.

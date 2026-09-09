@@ -99,7 +99,7 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
         response.headers["X-Content-Type-Options"] = "nosniff"
         response.headers["X-Frame-Options"] = "DENY"
         response.headers["Referrer-Policy"] = "same-origin"
-        if request.endpoint != "static":
+        if request.endpoint not in ("static", "favicon"):
             response.headers["Cache-Control"] = "no-store"
         return response
 
@@ -186,6 +186,11 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
         except ValueError as error:
             flash(str(error), "error")
         return redirect(url_for("index"))
+
+    @app.get("/favicon.ico")
+    def favicon():
+        # Browsers probe the site root regardless of the <link> tags.
+        return app.send_static_file("favicon.ico")
 
     @app.get("/status")
     def status():
