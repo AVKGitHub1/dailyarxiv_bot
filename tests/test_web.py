@@ -385,19 +385,54 @@ class AppCase(unittest.TestCase):
             self.wait_job()
         self.assertEqual(self.store.read()["preview"]["id"], "preview-1")
 
-    def test_schedule_keeps_days_time_window_and_restart_guard(self):
+    def test_schedule_extends_retry_window_and_keeps_days_and_restart_guard(self):
         zone = self.service.timezone
         for date, clock, due in [("2026-09-06", "21:30", True), ("2026-09-07", "21:35", True),
                                  ("2026-09-10", "21:39", True), ("2026-09-11", "21:30", False),
                                  ("2026-09-12", "21:30", False), ("2026-09-08", "21:29", False),
-                                 ("2026-09-08", "21:40", False)]:
+                                 ("2026-09-08", "21:40", True), ("2026-09-08", "22:30", True),
+                                 ("2026-09-08", "23:29:59", True), ("2026-09-08", "23:30", False),
+                                 ("2026-09-09", "00:00", False), ("2026-09-11", "22:30", False),
+                                 ("2026-09-12", "22:30", False), ("2026-12-08", "22:30", True)]:
             now = datetime.datetime.fromisoformat(f"{date}T{clock}").replace(tzinfo=zone)
             self.assertEqual(bool(self.service.due_slot(now)), due, (date, clock))
         self.store.update(lambda state: state["schedule_slots"].update({"2026-09-08 21:30": "sent"}))
         restarted = DigestService(StateStore(self.temp.name, ROOT), CONFIG)
-        self.assertIsNone(restarted.due_slot(datetime.datetime(2026, 9, 8, 21, 35, tzinfo=zone)))
+        self.addCleanup(restarted.close)
+        self.assertIsNone(restarted.due_slot(datetime.datetime(2026, 9, 8, 22, 30, tzinfo=zone)))
         self.assertEqual(datetime.datetime(2026, 9, 8, 21, 30, tzinfo=zone).utcoffset().total_seconds(), -7 * 3600)
         self.assertEqual(datetime.datetime(2026, 12, 8, 21, 30, tzinfo=zone).utcoffset().total_seconds(), -8 * 3600)
+
+    def test_scheduled_timeout_can_recover_after_old_cutoff_without_duplicate_send(self):
+        zone = self.service.timezone
+        slot = self.service.due_slot(datetime.datetime(2026, 10, 6, 21, 30, tzinfo=zone))
+        self.assertEqual(slot, "2026-10-06 21:30")
+        with patch.object(bot, "build_daily_payload", side_effect=TimeoutError("arXiv timed out")), \
+                patch.object(bot, "post_to_slack") as send, self.assertLogs("digest_service", level="ERROR"):
+            self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+            self.wait_job()
+        send.assert_not_called()
+        self.assertNotIn(slot, self.store.read()["schedule_slots"])
+        self.assertEqual(self.store.read()["job"]["status"], "error")
+
+        # The unfinished slot survives a restart and remains eligible an hour later.
+        restarted = DigestService(StateStore(self.temp.name, ROOT), CONFIG)
+        self.addCleanup(restarted.close)
+        later = datetime.datetime(2026, 10, 6, 22, 30, tzinfo=zone)
+        self.assertEqual(restarted.due_slot(later), slot)
+        with patch.object(bot, "build_daily_payload", return_value={
+            "date_str": "2026-10-07", "papers": [paper("2610.00001")],
+        }) as build, patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send:
+            restarted.start("scheduled", target_date="2026-10-07", slot=slot)
+            restarted.worker.join(timeout=10)
+            self.assertFalse(restarted.worker.is_alive())
+            self.assertEqual(restarted.store.read()["job"]["status"], "success")
+            self.assertEqual(build.call_args.kwargs["target_date"], "2026-10-07")
+            self.assertEqual(send.call_count, 2)  # Digest and its abstract thread.
+            self.assertIsNone(restarted.due_slot(later))
+            with self.assertRaisesRegex(ValueError, "already completed"):
+                restarted.start("scheduled", target_date="2026-10-07", slot=slot)
+            self.assertEqual(send.call_count, 2)
 
     def test_last_message_titles_expand_and_link_to_arxiv(self):
         self.store.update(lambda state: state.update(last_message={

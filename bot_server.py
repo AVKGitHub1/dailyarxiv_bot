@@ -6,7 +6,7 @@ import time
 import slackbot_daily_arxiv as bot
 
 TIMES = ["21:30"]  # Times to send messages (24-hour format)
-SEND_WINDOW_SECONDS = 10 * 60
+SEND_WINDOW_SECONDS = 2 * 60 * 60  # Retry the 21:30 slot until 23:30.
 RETRY_DELAY_SECONDS = 60
 SECONDS_PER_DAY = 24 * 60 * 60
 ALLOWED_WEEKDAYS = {6, 0, 1, 2, 3}  # Sunday(6) through Thursday(3)

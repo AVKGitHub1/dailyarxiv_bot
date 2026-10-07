@@ -63,7 +63,7 @@ There is no import of messages sent by the old standalone scripts. Until the fir
 
 ### Preserved schedule
 
-The container uses the existing schedule from `bot_server.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. The original ten-minute send window and one-minute retry delay are preserved; missed slots outside that window are not backfilled.
+The container uses the existing schedule from `bot_server.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. Failed runs retry every minute within a **two-hour send window (21:30 up to, but not including, 23:30)**, stopping once the slot completes. A restart within that window resumes an unfinished slot; missed slots outside the window are not backfilled. The window is set by `SEND_WINDOW_SECONDS` in `bot_server.py`.
 
 A scheduled run with nothing to send still posts a notice, matching the original host script, so a quiet channel always means the bot is broken rather than idle. When nothing matched at all, the notice is the original `No papers found with specified authors! / ...keywords!` text. When papers matched but had all been delivered by an earlier send that day, the notice says so instead, rather than falsely claiming nothing was found. Neither notice changes **Last message** or the comparison list. A manual **Send** with no new papers posts nothing and reports "There are no new papers to send."
 
