@@ -39,6 +39,7 @@ class StateStore:
                     "last_message": None,
                     "baseline_ids": [],
                     "schedule_slots": {},
+                    "scheduled_empty_since": None,
                     "job": None,
                     "password_hash": generate_password_hash(self.initial_password),
                     "session_secret": secrets.token_hex(32),

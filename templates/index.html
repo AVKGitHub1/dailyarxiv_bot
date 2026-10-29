@@ -24,7 +24,7 @@
       <section class="panel digest">
         <div class="section-heading"><h2>Last message</h2><span class="count">{{ last_message.papers | length if last_message else 0 }} papers</span></div>
         {% if last_message %}
-          <p class="section-note">Papers for {{ last_message.date }} · Sent {{ last_message.sent_at | local_time }}</p>
+          <p class="section-note">Papers for {% if last_message.date_from and last_message.date_from != last_message.date %}{{ last_message.date_from }} through {% endif %}{{ last_message.date }} · Sent {{ last_message.sent_at | local_time }}</p>
           <p class="hint">Click a title to read its abstract.</p>
           {{ paper_list(last_message.papers) }}
         {% else %}
@@ -51,8 +51,8 @@
         {% endif %}
         {% if preview %}
           {% if preview.papers %}<p class="hint">Click a title to read its abstract.</p>{% endif %}
-          <p class="hint">Papers for {{ preview.date }} · Generated {{ preview.generated_at | local_time }}</p>
-          {% if preview.papers %}{{ paper_list(preview.papers, true) }}{% else %}<div class="empty-state compact"><h3>No matching papers for this date.</h3><p>Try a different date or suggest an addition to the watchlists.</p></div>{% endif %}
+          <p class="hint">Papers for {% if preview.date_from and preview.date_from != preview.date %}{{ preview.date_from }} through {% endif %}{{ preview.date }} · Generated {{ preview.generated_at | local_time }}</p>
+          {% if preview.papers %}{{ paper_list(preview.papers, true) }}{% else %}<div class="empty-state compact"><h3>No matching papers for {% if preview.date_from and preview.date_from != preview.date %}these dates{% else %}this date{% endif %}.</h3><p>Try a different date or suggest an addition to the watchlists.</p></div>{% endif %}
         {% else %}
           <div class="empty-state compact"><h3>Ready when you are.</h3><p>An admin can regenerate a preview at any time. Automatic delivery uses the following day’s paper date.</p></div>
         {% endif %}

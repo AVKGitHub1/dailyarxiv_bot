@@ -82,21 +82,26 @@ def load_watchlists(important_people=None, keywords=None):
     )
 
 
-def fetch_papers_for_date(date_str, config=None):
+def fetch_papers_for_date(date_str, config=None, *, date_from=None):
+    """Fetch an inclusive OAI metadata date range, defaulting to a single day."""
+    date_str = datetime.date.fromisoformat(date_str).isoformat()
+    date_from = datetime.date.fromisoformat(date_from or date_str).isoformat()
+    if date_from > date_str:
+        raise ValueError("The first paper date must not be after the last paper date.")
     config = config if config is not None else load_config()
     frames = []
     for category, subcategories in zip(config["categories"], config["subcat"]):
         if not subcategories:
             scraper = arxivscraper.Scraper(
                 category=category,
-                date_from=date_str,
+                date_from=date_from,
                 date_until=date_str,
                 t=5,
             )
         else:
             scraper = arxivscraper.Scraper(
                 category=category,
-                date_from=date_str,
+                date_from=date_from,
                 date_until=date_str,
                 t=6,
                 filters={"categories": subcategories},
@@ -260,7 +265,11 @@ def build_abstract_thread_message(date, df, imp_author_idx, imp_keyword_idx):
     return "\n".join(lines)
 
 
-def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_date=None):
+def paper_date_label(date_str, date_from=None):
+    return f"{date_from} through {date_str}" if date_from and date_from != date_str else date_str
+
+
+def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_date=None, date_from=None):
     (
         important_people,
         _important_firsts,
@@ -279,7 +288,7 @@ def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_
     date_str = tomorrow_date.strftime("%Y-%m-%d")
 
     try:
-        df = fetch_papers_for_date(date_str, config=config)
+        df = fetch_papers_for_date(date_str, config=config, date_from=date_from)
     except Exception as ex:
         logger.exception("Error fetching papers for date %s: %s", date_str, ex)
         raise
@@ -291,13 +300,15 @@ def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_
         important_lasts_lower,
         keywords_lower,
     )
-    msg_text = build_message(date_str, df, imp_author_idx, imp_keyword_idx, which_authors)
+    date_label = paper_date_label(date_str, date_from)
+    msg_text = build_message(date_label, df, imp_author_idx, imp_keyword_idx, which_authors)
 
     thread_text = build_abstract_thread_message(
-        date_str, df, imp_author_idx, imp_keyword_idx)
+        date_label, df, imp_author_idx, imp_keyword_idx)
 
     return {
         "date_str": date_str,
+        "date_from": date_from or date_str,
         "df": df,
         "imp_author_idx": imp_author_idx,
         "imp_keyword_idx": imp_keyword_idx,
@@ -318,15 +329,16 @@ def build_daily_payload(date_diff=None, *, config=None, watchlists=None, target_
     }
 
 
-def payload_from_papers(date_str, papers):
+def payload_from_papers(date_str, papers, *, date_from=None):
     """Format an already reviewed selection without fetching arXiv again."""
     df = pd.DataFrame(papers)
     author_idx = [idx for idx, paper in enumerate(papers) if paper["selection"] == "author"]
     keyword_idx = [idx for idx, paper in enumerate(papers) if paper["selection"] != "author"]
     which_authors = [paper.get("selected_for", "") + ", " for paper in papers]
+    date_label = paper_date_label(date_str, date_from)
     return {
-        "msg_text": build_message(date_str, df, author_idx, keyword_idx, which_authors),
-        "thread_text": build_abstract_thread_message(date_str, df, author_idx, keyword_idx),
+        "msg_text": build_message(date_label, df, author_idx, keyword_idx, which_authors),
+        "thread_text": build_abstract_thread_message(date_label, df, author_idx, keyword_idx),
     }
 
 

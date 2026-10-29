@@ -241,7 +241,7 @@ class AppCase(unittest.TestCase):
         posted = send.call_args.args[1]
         # The heartbeat still lands, but it must not claim nothing was found.
         self.assertIn("*Papers for 2026-09-09*", posted)
-        self.assertIn("All 2 matching papers were already sent earlier today.", posted)
+        self.assertIn("All 2 matching papers were already sent.", posted)
         self.assertNotIn("No papers found", posted)
         self.assertIn("2026-09-08 21:30", self.store.read()["schedule_slots"])
 
@@ -456,6 +456,18 @@ class AppCase(unittest.TestCase):
         page = self.client.get("/").data
         self.assertIn(b"MANY AUTHORS", page)
         self.assertNotIn(b"Author 15", page)
+
+    def test_catch_up_dates_are_displayed_without_changing_the_date_input(self):
+        self.preview([paper("2609.00001")])
+        self.store.update(lambda state: state["preview"].update(date_from="2026-09-08"))
+        self.store.update(lambda state: state.update(last_message={
+            "date": "2026-09-09", "date_from": "2026-09-08",
+            "sent_at": "2026-09-09T04:30:00+00:00", "papers": [paper("2609.00001")],
+        }))
+        self.login()
+        page = self.client.get("/").data
+        self.assertEqual(page.count(b"Papers for 2026-09-08 through 2026-09-09"), 2)
+        self.assertIn(b'name="date" value="2026-09-09"', page)
 
 
 class CoreTests(unittest.TestCase):

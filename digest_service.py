@@ -52,6 +52,15 @@ class DigestService:
         self.last_tick = time.monotonic()
 
         def recover(state):
+            if "scheduled_empty_since" not in state:
+                # Upgrade existing volumes, including a quiet day recorded by
+                # the old version immediately before this update.
+                preview, job = state["preview"], state["job"] or {}
+                state["scheduled_empty_since"] = (
+                    preview["date"] if preview and not preview["papers"]
+                    and job.get("action") == "scheduled" and job.get("status") == "success"
+                    else None
+                )
             if state["job"] and state["job"]["status"] == "running":
                 state["job"].update(status="interrupted", message="The previous job was interrupted by a restart. Review the last message before trying again.", finished_at=timestamp())
 
@@ -106,7 +115,7 @@ class DigestService:
         try:
             self._reload_config()
             if action != "send":
-                self._regenerate(target_date)
+                self._regenerate(target_date, scheduled=action == "scheduled")
             if action != "regenerate":
                 self._send(action, slot)
             else:
@@ -118,19 +127,35 @@ class DigestService:
         finally:
             self.lock.release()
 
-    def _regenerate(self, target_date):
+    def _regenerate(self, target_date, *, scheduled=False):
         state = self.store.read()
+        date_from = target_date
+        if scheduled and state["scheduled_empty_since"]:
+            date_from = min(date_from, state["scheduled_empty_since"])
         payload = bot.build_daily_payload(
-            config=self.config, target_date=target_date,
+            config=self.config, target_date=target_date, date_from=date_from,
             watchlists=(state["authors"], state["keywords"]),
         )
         preview = {
             "id": secrets.token_hex(12), "date": payload["date_str"],
+            "date_from": date_from,
             "generated_at": timestamp(), "papers": payload["papers"],
         }
-        self.store.update(lambda state: state.update(preview=preview))
+        def record_preview(state):
+            state["preview"] = preview
+            if scheduled and not preview["papers"]:
+                state["scheduled_empty_since"] = date_from
 
-    def _complete_slot(self, state, slot):
+        self.store.update(record_preview)
+
+    def _complete_slot(self, state, slot, *, action=None):
+        pending = state["scheduled_empty_since"]
+        preview = state["preview"]
+        if (action == "scheduled" and pending and preview["papers"]
+                and preview.get("date_from", preview["date"]) <= pending <= preview["date"]):
+            # Clear only after delivery (or confirmation every match was already
+            # sent), so a Slack error/restart cannot lose the catch-up range.
+            state["scheduled_empty_since"] = None
         if slot:
             state["schedule_slots"][slot] = timestamp()
             # Keep a month of persistent restart guards.
@@ -154,25 +179,25 @@ class DigestService:
                 # Matches existed but every one went out earlier; the old script's
                 # "no papers found" wording would be untrue here.
                 notice = "\n".join([
-                    f"*Papers for {preview['date']}*:",
+                    f"*Papers for {bot.paper_date_label(preview['date'], preview.get('date_from'))}*:",
                     "-----------------------",
                     "",
-                    "The only matching paper was already sent earlier today."
+                    "The only matching paper was already sent."
                     if len(preview["papers"]) == 1 else
-                    f"All {len(preview['papers'])} matching papers were already sent earlier today.",
+                    f"All {len(preview['papers'])} matching papers were already sent.",
                     "-----------------------",
                 ])
                 message = "No new papers since the last send. Posted the daily notice to Slack."
             else:
-                notice = bot.payload_from_papers(preview["date"], [])["msg_text"]
+                notice = bot.payload_from_papers(preview["date"], [], date_from=preview.get("date_from"))["msg_text"]
                 message = "No new papers. Posted the daily notice to Slack."
             bot.post_to_slack(self._client(), notice, channel=self.config["channel"])
-            self.store.update(lambda state: self._complete_slot(state, slot))
+            self.store.update(lambda state: self._complete_slot(state, slot, action=action))
             self._finish("success", message)
             return
         preview = state["preview"]
         client = self._client()
-        payload = bot.payload_from_papers(preview["date"], papers)
+        payload = bot.payload_from_papers(preview["date"], papers, date_from=preview.get("date_from"))
         # The first chunk anchors the abstract thread; continuations post at the
         # top level so the title list stays scannable in-channel.
         parent_chunks = list(slack_chunks(payload["msg_text"])) or [payload["msg_text"]]
@@ -181,13 +206,14 @@ class DigestService:
             raise RuntimeError("Slack did not confirm delivery.")
         last_message = {
             "date": preview["date"], "sent_at": timestamp(), "papers": papers,
+            "date_from": preview.get("date_from", preview["date"]),
             "slack_ts": response["ts"], "abstracts_sent": False,
         }
 
         def record_delivery(state):
             state["last_message"] = last_message
             state["baseline_ids"] = [paper_key(paper) for paper in preview["papers"]]
-            self._complete_slot(state, slot)
+            self._complete_slot(state, slot, action=action)
 
         # Record the parent before posting the abstract thread. A thread error
         # must never cause a retry to post the same parent again.
