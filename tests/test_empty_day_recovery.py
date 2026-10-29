@@ -35,6 +35,7 @@ class EmptyDayRecoveryTests(unittest.TestCase):
         self.restart()
         self.records_by_date = {}
         self.queries = []
+        self.queries_before = 0
 
         def scraper(**kwargs):
             self.queries.append(kwargs)
@@ -55,6 +56,7 @@ class EmptyDayRecoveryTests(unittest.TestCase):
         self.addCleanup(self.service.close)
 
     def run_day(self, date, *, action="scheduled"):
+        self.queries_before = len(self.queries)
         slot = None
         if action == "scheduled":
             local_date = datetime.date.fromisoformat(date) - datetime.timedelta(days=1)
@@ -65,8 +67,10 @@ class EmptyDayRecoveryTests(unittest.TestCase):
         return self.store.read()
 
     def assert_range(self, start, end):
-        self.assertEqual(len(self.queries[-2:]), 2)
-        for query in self.queries[-2:]:
+        # Only queries made by the latest run count, one per configured category.
+        queries = self.queries[self.queries_before:]
+        self.assertEqual(len(queries), len(CONFIG["categories"]))
+        for query in queries:
             self.assertEqual((query["date_from"], query["date_until"]), (start, end))
 
     def test_empty_day_survives_restart_and_recovers_both_days_without_duplicates(self):
@@ -143,13 +147,16 @@ class EmptyDayRecoveryTests(unittest.TestCase):
         with patch.object(bot, "post_to_slack", side_effect=RuntimeError("offline")), \
                 self.assertLogs("digest_service", level="ERROR"):
             state = self.run_day("2026-10-30")
+        self.assert_range("2026-10-29", "2026-10-30")
         self.assertEqual(state["job"]["status"], "error")
         self.assertEqual(state["scheduled_empty_since"], "2026-10-29")
         self.assertEqual(state["baseline_ids"], [])
         self.assertNotIn("2026-10-29 21:30", state["schedule_slots"])
         self.restart()
         state = self.run_day("2026-10-30")
-        self.assert_range("2026-10-29", "2026-10-30")
+        # Only Slack failed, so the retry reuses the papers already fetched.
+        self.assertEqual(self.queries[self.queries_before:], [])
+        self.assertEqual(state["last_message"]["date_from"], "2026-10-29")
         self.assertIsNone(state["scheduled_empty_since"])
         self.assertEqual(state["last_message"]["papers"][0]["id"], "late")
 

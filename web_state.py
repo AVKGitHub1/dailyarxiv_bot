@@ -9,6 +9,8 @@ from pathlib import Path
 
 from werkzeug.security import generate_password_hash
 
+from slackbot_daily_arxiv import strip_parentheticals
+
 
 def timestamp():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -43,9 +45,12 @@ class StateStore:
                     "job": None,
                     "password_hash": generate_password_hash(self.initial_password),
                     "session_secret": secrets.token_hex(32),
+                    "device_secret": secrets.token_hex(32),
                 }
                 conn.execute("INSERT INTO state (id, value) VALUES (1, ?)", (json.dumps(state),))
             conn.commit()
+        # Volumes created before trusted-device cookies existed get their secret here.
+        self.update(lambda state: state.setdefault("device_secret", secrets.token_hex(32)))
         self.path.chmod(0o600)
 
     @contextmanager
@@ -77,7 +82,8 @@ class StateStore:
         value = " ".join(value.split())
         if not value or len(value) > 160:
             raise ValueError("Suggestions must contain 1–160 characters.")
-        if kind == "authors" and (len(value.split()) < 2 or value.startswith("(")):
+        # Count words outside parentheses: "John (MIT)" is one name, not two.
+        if kind == "authors" and (len(strip_parentheticals(value).split()) < 2 or value.startswith("(")):
             raise ValueError("Enter the author's first and last name.")
 
         def add(state):

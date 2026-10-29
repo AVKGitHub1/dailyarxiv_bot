@@ -16,7 +16,7 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && chown arxiv:arxiv /data \
     && chmod 700 /data
 
-COPY slackbot_daily_arxiv.py bot_server.py web_app.py web_state.py digest_service.py arxiv_source.py ./
+COPY slackbot_daily_arxiv.py schedule_config.py web_app.py web_state.py digest_service.py arxiv_source.py ./
 COPY important_people.txt keywords.txt ./
 COPY templates/ ./templates/
 COPY static/ ./static/
@@ -25,6 +25,6 @@ USER arxiv
 VOLUME ["/data"]
 EXPOSE 8765
 HEALTHCHECK --interval=30s --timeout=5s --start-period=20s --retries=3 \
-    CMD python -c "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8765/healthz', timeout=3)"
+    CMD ["python", "-c", "import os, urllib.request; urllib.request.urlopen('http://127.0.0.1:%s/healthz' % os.environ.get('PORT', '8765'), timeout=3)"]
 
 CMD ["python", "web_app.py"]

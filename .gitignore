@@ -71,7 +71,6 @@ venv.bak/
 
 # OS
 Thumbs.db
-.DS_Store
 
 # Node (if applicable)
 node_modules/

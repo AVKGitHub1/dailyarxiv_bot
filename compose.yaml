@@ -4,10 +4,16 @@ services:
     init: true
     restart: unless-stopped
     ports:
-      - "0.0.0.0:8765:8765"
+      # Set ARXIV_PORT (shell or .env) to serve on another port; both sides follow it.
+      # Behind a reverse proxy on this host, set ARXIV_BIND=127.0.0.1 so only the proxy
+      # can reach the app, then set TRUSTED_PROXY_HOPS.
+      - "${ARXIV_BIND:-0.0.0.0}:${ARXIV_PORT:-8765}:${ARXIV_PORT:-8765}"
     environment:
       TZ: America/Los_Angeles
       SCHEDULER_ENABLED: "1"
+      PORT: "${ARXIV_PORT:-8765}"
+      COOKIE_SECURE: "${COOKIE_SECURE:-0}"
+      TRUSTED_PROXY_HOPS: "${TRUSTED_PROXY_HOPS:-0}"
     volumes:
       - type: bind
         source: ./config.yml

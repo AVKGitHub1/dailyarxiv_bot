@@ -1,5 +1,13 @@
 # Slack delivery parity: changes to apply
 
+> **Status: applied in commit 2b39e48.** This file is kept as a design record, not a to-do list.
+> Some details below have since changed. The quiet-day notice gained a separate "already sent"
+> wording when it was applied. The send window is now two hours, not ten minutes (commit 3206561).
+> Scheduled runs now carry an empty-day catch-up range (commit fa1c946). The autoheal sidecar in
+> 4b (iii) was deliberately not added. The "optional follow-up" in section 4c was later done: the
+> schedule constants moved to `schedule_config.py`, and the host runner moved to `archive/`.
+> File paths below are as they were at the time. The code and README are authoritative.
+
 Purpose: bring the Dockerised web/scheduler path (`digest_service.py`, `web_app.py`) back to
 parity with the original host script path (`slackbot_daily_arxiv.py` + `bot_server.py`) where it
 silently diverged, and to harden delivery.
@@ -289,7 +297,7 @@ if __name__ == "__main__":
 3. `README.md`: mark `bot_server.py` and `run_bot_example.vbs` as legacy/pre-Docker, and state
    that they target the same channel as the container.
 
-**Optional follow-up, not required:** `digest_service` imports `bot_server` only for the schedule
+**Optional follow-up, not required:** `digest_service` and `web_app` import `bot_server` only for the schedule
 constants, which is why the file must stay in the image. Moving `TIMES`, `SEND_WINDOW_SECONDS`,
 `RETRY_DELAY_SECONDS` and `ALLOWED_WEEKDAYS` into a small `schedule_config.py` imported by both
 would let `bot_server.py` drop out of the Dockerfile `COPY` and the `.dockerignore` allowlist

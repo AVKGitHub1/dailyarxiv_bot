@@ -1,6 +1,18 @@
 # Run from an elevated PowerShell. Never restarts Windows automatically.
+# Without -Port it uses ARXIV_PORT as Compose does: the environment first, then .env
+# beside compose.yaml, else 8765. An elevated session may not inherit your variables.
+param([int]$Port = 0)
 $ErrorActionPreference = 'Stop'
 $projectDirectory = Split-Path -Parent $PSScriptRoot
+if ($Port -le 0) {
+    $configured = $env:ARXIV_PORT
+    $envFile = Join-Path $projectDirectory '.env'
+    if (-not $configured -and (Test-Path -LiteralPath $envFile)) {
+        $line = Get-Content -LiteralPath $envFile | Where-Object { $_ -match '^\s*ARXIV_PORT\s*=' } | Select-Object -Last 1
+        if ($line) { $configured = ($line -split '=', 2)[1].Trim().Trim('"', "'") }
+    }
+    $Port = if ($configured) { [int]$configured } else { 8765 }
+}
 $resultDirectory = Join-Path $projectDirectory 'data'
 New-Item -ItemType Directory -Path $resultDirectory -Force | Out-Null
 $result = [ordered]@{ Features = @(); RestartNeeded = $false; Firewall = ''; Error = '' }
@@ -15,11 +27,11 @@ try {
         $result.Features += @{ Name = $featureName; State = [string]$currentFeature.State }
         if ([string]$currentFeature.State -eq 'EnablePending') { $result.RestartNeeded = $true }
     }
-    $ruleName = 'DailyArxiv-LAN-8765'
+    $ruleName = "DailyArxiv-LAN-$Port"
     if (-not (Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue)) {
-        New-NetFirewallRule -Name $ruleName -DisplayName 'Daily arXiv - local network TCP 8765' -Direction Inbound -Action Allow -Protocol TCP -LocalPort 8765 -RemoteAddress LocalSubnet -Profile Private,Domain | Out-Null
+        New-NetFirewallRule -Name $ruleName -DisplayName "Daily arXiv - local network TCP $Port" -Direction Inbound -Action Allow -Protocol TCP -LocalPort $Port -RemoteAddress LocalSubnet -Profile Private,Domain | Out-Null
     }
-    $result.Firewall = 'TCP 8765 allowed from local subnets on Private and Domain networks.'
+    $result.Firewall = "TCP $Port allowed from local subnets on Private and Domain networks."
 } catch {
     $result.Error = $_.Exception.Message
 } finally {

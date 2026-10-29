@@ -9,8 +9,8 @@ This bot:
 - Queries arXiv metadata for configured categories, subcategories, and a selected date (the following day by default).
 - Flags papers as important if they match people in `important_people.txt` or terms in `keywords.txt`.
 - Posts a formatted digest to a Slack channel.
-- Can run once or on a daily schedule.
-- Runs in Docker with a public dashboard and password-protected admin controls. The container is the supported way to run the schedule; `bot_server.py` and `run_bot_example.vbs` are the pre-Docker host runners kept for reference.
+- Sends on a daily schedule, or on demand from the admin dashboard.
+- Runs in Docker with a public dashboard and password-protected admin controls. The pre-Docker host scripts are archived in `archive/` and are not part of the app.
 
 ## Docker dashboard
 
@@ -36,7 +36,7 @@ docker compose up -d --build
 docker compose logs arxiv-bot
 ```
 
-Open **http://localhost:8765** on this computer, or **http://<this-computer's-LAN-IP>:8765** on another device. Use `ipconfig` to find the computer's LAN IPv4 address. The port is published on all host interfaces. On Windows, allow inbound TCP 8765 from local subnets on your Private/Domain network; `scripts/enable-docker-prerequisites.ps1` configures this along with the required WSL features when run as administrator. It never restarts Windows automatically.
+Open **http://localhost:8765** on this computer, or **http://<this-computer's-LAN-IP>:8765** on another device. Use `ipconfig` to find the computer's LAN IPv4 address. The port is published on all host interfaces. To serve on another port, set `ARXIV_PORT` in the shell or in a `.env` file next to `compose.yaml`; the published port, the app, and the container health check all follow it. The firewall script reads `ARXIV_PORT` the same way, or takes `-Port <n>`; an elevated PowerShell may not inherit variables set in your normal session. On Windows, allow inbound TCP 8765 from local subnets on your Private/Domain network; `scripts/enable-docker-prerequisites.ps1` configures this along with the required WSL features when run as administrator. It never restarts Windows automatically.
 
 On the first launch with a new data volume, the logs display:
 
@@ -63,17 +63,17 @@ There is no import of messages sent by the old standalone scripts. Until the fir
 
 ### Preserved schedule
 
-The container uses the existing schedule from `bot_server.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. Failed runs retry every minute within a **two-hour send window (21:30 up to, but not including, 23:30)**, stopping once the slot completes. A restart within that window resumes an unfinished slot; missed slots outside the window are not backfilled. The window is set by `SEND_WINDOW_SECONDS` in `bot_server.py`.
+The container keeps the original host script's schedule, now set in `schedule_config.py`: **21:30, Sunday through Thursday**, in **America/Los_Angeles**, including daylight saving time. It still queries the following day's paper date. At each scheduled time it regenerates and sends using the same new-paper rule. Failed runs retry every minute within a **two-hour send window (21:30 up to, but not including, 23:30)**, stopping once the slot completes. When arXiv was fetched but Slack failed, the retry reuses those papers instead of querying arXiv again, as long as the watchlists and categories are unchanged; this holds across a restart too. A restart within that window resumes an unfinished slot; missed slots outside the window are not backfilled. The window is set by `SEND_WINDOW_SECONDS` in `schedule_config.py`.
 
 If a scheduled query finds **no matching papers**, the next scheduled query includes that empty date through the new target date, inclusive. For example, an empty query for October 29 makes the next query cover **October 29–30**. Consecutive empty results retain the earliest empty date, including across weekends and restarts. The range returns to one day after matches are successfully delivered or confirmed already sent. Fetch or Slack delivery errors do not clear a pending range. A result containing only previously sent matches does not start a new empty period. These dates filter arXiv's OAI metadata modification dates, not the papers' original submission dates.
 
 The dashboard and Slack digest display the full queried range. Manual **Regenerate** still queries only the selected date and does not change the scheduled catch-up range. Upgrading an existing data volume carries forward its latest successful empty scheduled preview, if present.
 
-A scheduled run with nothing to send still posts a notice, matching the original host script, so a quiet channel always means the bot is broken rather than idle. When nothing matched at all, the notice is the original `No papers found with specified authors! / ...keywords!` text. When papers matched but had all been delivered by an earlier send that day, the notice says so instead, rather than falsely claiming nothing was found. Neither notice changes **Last message** or the comparison list. A manual **Send** with no new papers posts nothing and reports "There are no new papers to send."
+A scheduled run with nothing to send still posts a notice, matching the original host script, so a quiet channel always means the bot is broken rather than idle. When nothing matched at all, the notice is the original `No papers found with specified authors! / ...keywords!` text. When papers matched but had all been delivered by an earlier send, the notice says so instead, rather than falsely claiming nothing was found. Neither notice changes **Last message** or the comparison list. A manual **Send** with no new papers posts nothing and reports "There are no new papers to send."
 
-The web server and scheduler share one process and serialize their jobs. Completed schedule slots persist through restarts. Run one container for a given data volume, and keep the old `bot_server.py`/VBS scheduler stopped; both read the same `channel` from the same `config.yml`, so running both posts two digests a night and the container's deduplication cannot see the host's sends.
+The web server and scheduler share one process and serialize their jobs. Completed schedule slots persist through restarts. Run one container for a given data volume, and keep the archived host scheduler (`archive/bot_server.py` and its VBS launcher) stopped; both read the same `channel` from the same `config.yml`, so running both posts two digests a night and the container's deduplication cannot see the host's sends.
 
-The digest still groups author matches before keyword matches and posts abstracts as Slack thread replies. A digest too long for one Slack message is split across several top-level messages, and the abstract thread hangs off the first of them; large abstract threads are likewise split into smaller replies. A failed parent post leaves the comparison list unchanged. If the parent succeeds but a continuation message or a thread reply fails, the message is recorded as delivered and the dashboard reports the partial failure, so retrying does not duplicate the parent. The Slack client retries rate-limited requests up to three times.
+The digest still groups author matches before keyword matches and posts abstracts as Slack thread replies. A digest too long for one Slack message is split across several top-level messages, and the abstract thread hangs off the first of them; large abstract threads are likewise split into smaller replies. A failed parent post leaves the comparison list unchanged. If the parent succeeds but a continuation message or a thread reply fails, the message is recorded as delivered and the dashboard reports the partial failure, so retrying does not duplicate the parent. The abstract thread is still posted after a failed continuation message, and the dashboard names whichever parts are missing. The Slack client retries rate-limited requests up to three times.
 
 ### Scheduler health
 
@@ -103,7 +103,14 @@ docker compose restart arxiv-bot
 
 To recover the password while the service is stopped, use `docker compose run --rm --no-deps arxiv-bot python web_app.py --reset-admin-password`, then start it normally. Do not use `docker compose down -v` unless you intend to erase all saved state. Back up the named volume while the service is stopped.
 
-The application runs as a non-root user behind Waitress. Form submissions have CSRF protection, sessions expire after eight hours, and login/suggestion attempts are rate limited. The default HTTP setup is for your trusted LAN. If serving it through HTTPS, set `COOKIE_SECURE=1` in Compose so the session cookie is sent only over HTTPS.
+The application runs as a non-root user behind Waitress. Form submissions have CSRF protection, and sessions expire after eight hours of inactivity. Login and suggestion attempts are rate limited. Docker Desktop shows every LAN client to the container as one address, so the limits avoid relying on addresses alone:
+
+- Only failed logins count, 10 per 15 minutes.
+- A browser that has signed in before keeps its own login allowance, even after a password reset. Failed guesses from elsewhere on the LAN cannot lock it out.
+- A browser signing in for the first time shares the allowance of its address. If someone exhausts it, wait 15 minutes or restart the container, which clears all limits.
+- Suggestions are limited to 20 an hour per browser and 60 an hour per address.
+
+The default HTTP setup is for your trusted LAN. If you serve it through a reverse proxy on this computer, set `ARXIV_BIND=127.0.0.1` so only the proxy can reach the app. Then set `TRUSTED_PROXY_HOPS` to the number of proxies, so client addresses come from `X-Forwarded-For`. Never set it while the port is reachable directly, because clients could forge that header. If serving it through HTTPS, set `COOKIE_SECURE=1` so the session cookie is sent only over HTTPS. Compose reads `ARXIV_BIND`, `TRUSTED_PROXY_HOPS`, and `COOKIE_SECURE` from the shell or `.env`, like `ARXIV_PORT`.
 
 ### Local development and checks
 
@@ -112,14 +119,15 @@ Python 3.11 or newer is required for the pinned dependencies; the image uses Pyt
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\python.exe -m pip install -r requirements.txt
-.\.venv\Scripts\python.exe -m unittest discover -s tests -v
+.\.venv\Scripts\python.exe -m unittest discover -s tests -v   # or python -m pytest, if pytest is installed
+.\.venv\Scripts\python.exe -m unittest discover -s archive     # the archived runner's own check
 
 # Run the webpage locally without automatic Slack delivery
 $env:SCHEDULER_ENABLED = "0"
 .\.venv\Scripts\python.exe web_app.py
 ```
 
-Local state defaults to `data/`. Configuration environment variables are `ARXIV_CONFIG` (path to config), `ARXIV_DATA_DIR` (database directory), `TZ` (default `America/Los_Angeles`), `PORT` (default `8765`), `SCHEDULER_ENABLED` (`1` by default), and `COOKIE_SECURE` (`0` by default).
+Local state defaults to `data/`. Configuration environment variables are `ARXIV_CONFIG` (path to config), `ARXIV_DATA_DIR` (database directory), `TZ` (default `America/Los_Angeles`), `PORT` (default `8765`; under Compose set `ARXIV_PORT` instead), `SCHEDULER_ENABLED` (`1` by default), `COOKIE_SECURE` (`0` by default), and `TRUSTED_PROXY_HOPS` (`0` by default). Compose also reads `ARXIV_BIND` (default `0.0.0.0`), the host address the port is published on.
 
 The unit/integration suite mocks Slack and arXiv. An optional real-browser check also mocks both services and uses temporary state:
 
@@ -130,18 +138,24 @@ The unit/integration suite mocks Slack and arXiv. An optional real-browser check
 
 This uses installed Microsoft Edge by default and checks public suggestions, admin approval, regeneration, sending only new papers, abstracts, and desktop/mobile layout. Screenshots are saved under `data/`. On another platform, install Chromium with `python -m playwright install chromium` and set `BROWSER_CHANNEL` to an empty string, or use another installed Playwright browser channel.
 
-The browser tab icon is `static/favicon.svg`; `static/favicon.ico` is generated from it for browsers that do not render SVG icons. After editing the SVG, regenerate and commit both with `python scripts/make_favicon_ico.py` (needs `playwright`, which the application itself never imports).
+The browser tab icon is `static/favicon.svg`; `static/favicon.ico` is generated from it for browsers that do not render SVG icons. After editing the SVG, regenerate and commit both with `python scripts/make_favicon_ico.py` (needs `playwright` and an installed Microsoft Edge; the application itself never imports `playwright`).
 
 ## Repository contents
 
-- `slackbot_daily_arxiv.py`: Core logic for loading config, scraping arXiv, classifying papers, and building/posting the Slack message.
-- `bot_server.py`: **Legacy (pre-Docker)** host scheduler loop that sends at one or more daily times. The container owns Slack delivery now; the file remains because `digest_service.py` imports its schedule constants. Running it directly requires `ARXIV_LEGACY_SCHEDULER=1`.
+- `web_app.py`: Flask/Waitress dashboard and the container entry point; also provides `--reset-admin-password`.
+- `digest_service.py`: Serialized regenerate/send jobs and the in-process scheduler.
+- `schedule_config.py`: Delivery times, days, send window, and retry delay.
+- `slackbot_daily_arxiv.py`: Config loading, watchlist matching, and Slack message formatting.
+- `arxiv_source.py`: arXiv OAI-PMH client that adapts `arxivscraper` to the current endpoint, with pagination, bounded retries, and a per-query timeout.
+- `web_state.py`: SQLite-backed state: watchlists, suggestions, preview, last message, schedule slots, and admin credentials.
+- `templates/`, `static/`: Dashboard HTML, CSS, JavaScript, and favicons.
+- `Dockerfile`, `compose.yaml`, `.dockerignore`: Container build and runtime.
 - `example_config.yml`: Template config for Slack + arXiv query settings.
-- `important_people.txt`: One person per line for author-based prioritization.
-- `keywords.txt`: One keyword/phrase per line for keyword-based prioritization.
-- `message_retrieve_test.py`: Generates the digest and writes it to `test_results.txt` without posting to Slack.
-- `slack_bot_test.py`: Sends the digest immediately to Slack.
-- `run_bot.vbs` / `run_bot_example.vbs`: **Legacy (pre-Docker)** Windows scripts for launching `bot_server.py` in the background. They post to the same channel as the container.
+- `important_people.txt`, `keywords.txt`: Seed watchlists, one entry per line, copied into a new data volume once.
+- `scripts/`: Windows WSL/firewall prerequisites script and the favicon generator.
+- `tests/`, `pytest.ini`: Unit/integration suite and the optional browser smoke check.
+- `docker_prompt.md`: The original request for the Docker dashboard.
+- `archive/`: The pre-Docker host runner, frozen and independent of the app. See [`archive/README.md`](archive/README.md).
 
 ## Requirements
 
@@ -168,7 +182,7 @@ Required keys:
 
 - `slack_token`: Slack bot token.
 - `channel`: channel name example: "#dailyarxiv".
-- `cols`: arXiv scraper output columns.
+- `cols`: arXiv scraper output columns to keep. It must include at least `id`, `title`, `abstract`, and `authors`.
 - `categories`: list of categories to query.
 - `subcat`: list of subcategory lists; must be the same length as `categories`.
 
@@ -178,48 +192,14 @@ Example:
 
 ## Run the bot
 
-### Dry run (no Slack post)
+Run it with Docker as described under **Docker dashboard**. The pre-Docker scripts for a dry run, a one-off send, and the host scheduler are archived with their instructions in [`archive/README.md`](archive/README.md).
 
-Build and save the message locally:
-
-```powershell
-python message_retrieve_test.py
-```
-
-Output is written to `test_results.txt`.
-
-### Send once to Slack
-
-```powershell
-python slack_bot_test.py
-```
-
-### Run scheduled daily sender (legacy, pre-Docker)
-
-Use the Docker dashboard instead. `bot_server.py` targets the **same channel** as the container, so running both double-posts every night. The entry point refuses to start unless you opt in:
-
-```powershell
-$env:ARXIV_LEGACY_SCHEDULER = "1"
-python bot_server.py
-```
-
-Before enabling it, confirm the container's scheduler is off (`SCHEDULER_ENABLED=0`, or the container stopped). Conversely, before the first scheduled slot after cutting over to Docker, remove any host registration of this script - check the Windows startup folder for the VBS and Task Scheduler for a task invoking `bot_server.py`.
-
-Edit schedule times in `bot_server.py`:
+To change the delivery time or days, edit `schedule_config.py` and rebuild the image:
 
 ```python
-TIMES = ["21:30"]  # 24-hour HH:MM, Sunday through Thursday
+TIMES = ["21:30"]  # 24-hour HH:MM, in the container's TZ
+ALLOWED_WEEKDAYS = {6, 0, 1, 2, 3}  # Sunday through Thursday
 ```
-
-Notes:
-
-- Time is interpreted in the machine's local timezone.
-- The scheduler uses a send window to avoid missing a slot if the process wakes a little late.
-- Daily send flags reset automatically when the local date changes.
-
-### Windows background launch (legacy, pre-Docker)
-
-`run_bot_example.vbs` launches `bot_server.py` silently. Update to the correct paths. It carries the same double-post caveat as above and needs `ARXIV_LEGACY_SCHEDULER=1` in its environment.
 
 ## Message structure
 
@@ -230,11 +210,14 @@ The Slack message contains:
 - "Important by keywords" section.
 - arXiv links in the form `www.arxiv.org/abs/<id>`.
 
+Titles, authors, and abstracts keep arXiv's own capitalization. Text saved in lowercase by older versions is still restored to sentence case. `&`, `<`, and `>` in paper text are escaped, so a title or abstract cannot form a Slack link or mention such as `<!channel>`.
+
 ## Troubleshooting
 
 - `KeyError: Missing required config keys`: Check `config.yml` includes all required fields.
 - Slack auth/channel errors: Verify token scopes and channel ID.
 - Empty results: The selected date/category/subcategory combo may have no papers.
+- `Skipping watchlist entry` in the logs: An author line has nothing outside parentheses, such as `(Google)`. It is ignored until fixed.
 
 ## Security and local config
 

@@ -1,6 +1,10 @@
 import contextlib
 import datetime
 import io
+import os
+import re
+import signal
+import sys
 import tempfile
 import threading
 import time
@@ -11,11 +15,13 @@ from unittest.mock import Mock, patch
 from slack_sdk.http_retry.builtin_handlers import RateLimitErrorRetryHandler
 
 import pandas as pd
-from werkzeug.security import generate_password_hash
+from flask import request
+from werkzeug.security import check_password_hash, generate_password_hash
 
 import slackbot_daily_arxiv as bot
 from digest_service import DigestService, new_papers, slack_chunks
-from web_app import create_app
+import web_app
+from web_app import DEVICE_COOKIE, SUGGEST_ADDRESS_LIMIT, RateLimiter, create_app
 from web_state import StateStore
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -34,6 +40,14 @@ class AppCase(unittest.TestCase):
         cls.password_hash = generate_password_hash("test-password")
 
     def setUp(self):
+        # Whatever the shell sets, run against the container's defaults.
+        self.enterContext(patch.dict(os.environ, {"TZ": "America/Los_Angeles", "COOKIE_SECURE": "0",
+                                                  "TRUSTED_PROXY_HOPS": "0", "SCHEDULER_ENABLED": "1",
+                                                  "PORT": "8765"}))
+        # Fail loudly instead of reaching the network if a test forgets a patch.
+        self.enterContext(patch("slack_sdk.web.base_client.BaseClient.api_call",
+                                side_effect=AssertionError("unpatched Slack call")))
+        self.enterContext(patch("arxiv_source.urlopen", side_effect=AssertionError("unpatched arXiv call")))
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
         output = io.StringIO()
@@ -93,13 +107,28 @@ class AppCase(unittest.TestCase):
             self.assertEqual(self.post(path).status_code, 403)
         self.assertEqual(self.client.get("/admin/send").status_code, 405)
 
-    def test_password_persisted_as_hash_and_only_printed_once(self):
-        self.assertIn("Admin password:", self.startup_output)
+    def database_bytes(self, directory=None):
+        return b"".join(path.read_bytes() for path in Path(directory or self.temp.name).iterdir() if path.is_file())
+
+    def test_generated_password_is_printed_once_and_stored_only_as_a_hash(self):
+        printed = re.search(r"Admin password: (\S+)", self.startup_output).group(1)
         with contextlib.redirect_stdout(io.StringIO()) as output:
             second = create_app(data_dir=self.temp.name, config=CONFIG)
         second.extensions["digest_service"].close()
         self.assertNotIn("Admin password:", output.getvalue())
-        self.assertNotIn("test-password", Path(self.store.path).read_bytes().decode("utf-8", errors="ignore"))
+        self.assertNotIn(printed.encode(), self.database_bytes())
+        # setUp replaced that hash, so prove the generated password itself on a fresh store.
+        with tempfile.TemporaryDirectory() as directory:
+            fresh = StateStore(directory, ROOT)
+            self.assertTrue(check_password_hash(fresh.read()["password_hash"], fresh.initial_password))
+            self.assertNotIn(fresh.initial_password.encode(), self.database_bytes(directory))
+        # A reset password is likewise stored only as a hash, and it rotates the session secret.
+        secret = self.store.read()["session_secret"]
+        reset = self.store.reset_password()
+        state = self.store.read()
+        self.assertTrue(check_password_hash(state["password_hash"], reset))
+        self.assertNotEqual(state["session_secret"], secret)
+        self.assertNotIn(reset.encode(), self.database_bytes())
 
     def test_login_logout_and_csrf(self):
         self.assertEqual(self.client.post("/login", data={"password": "test-password"}).status_code, 400)
@@ -143,7 +172,8 @@ class AppCase(unittest.TestCase):
         self.assertEqual(persisted["suggestions"], [])
 
     def test_suggestion_validation_dismissal_and_html_escaping(self):
-        for kind, value in [("invalid", "term"), ("authors", "Onlyname"), ("keywords", " "), ("keywords", "a\nb")]:
+        for kind, value in [("invalid", "term"), ("authors", "Onlyname"), ("authors", "John (MIT)"),
+                            ("keywords", " "), ("keywords", "a\nb")]:
             with self.assertRaises(ValueError):
                 self.store.suggest(kind, value)
         self.store.suggest("keywords", "<script>alert(1)</script>")
@@ -211,6 +241,7 @@ class AppCase(unittest.TestCase):
             self.wait_job()
         state = StateStore(self.temp.name, ROOT).read()
         self.assertEqual(state["job"]["status"], "partial")
+        self.assertIn("some abstracts in the thread", state["job"]["message"])
         self.assertFalse(state["last_message"]["abstracts_sent"])
         self.assertEqual(new_papers(state), [])
         self.assertIn("2026-09-08 21:30", state["schedule_slots"])
@@ -234,7 +265,8 @@ class AppCase(unittest.TestCase):
     def test_quiet_notice_says_already_sent_when_every_match_was_delivered(self):
         papers = [paper("2609.00001"), paper("2609.00002")]
         self.store.update(lambda state: state.update(baseline_ids=["2609.00001", "2609.00002"]))
-        with patch.object(bot, "build_daily_payload", return_value={"date_str": "2026-09-09", "papers": papers}),                 patch.object(bot, "post_to_slack") as send:
+        with patch.object(bot, "build_daily_payload", return_value={"date_str": "2026-09-09", "papers": papers}), \
+                patch.object(bot, "post_to_slack") as send:
             self.service.start("scheduled", target_date="2026-09-09", slot="2026-09-08 21:30")
             self.wait_job()
         self.assertEqual(send.call_count, 1)
@@ -269,7 +301,8 @@ class AppCase(unittest.TestCase):
 
         self.service.config_loader = loader
         self.preview([paper("2609.00001")])
-        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send,                 patch.object(bot, "make_slack_client") as client:
+        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send, \
+                patch.object(bot, "make_slack_client") as client:
             self.service.start("send", preview_id="preview-1")
             self.wait_job()
         self.assertEqual(len(loads), 1)
@@ -289,7 +322,8 @@ class AppCase(unittest.TestCase):
 
         self.service.config_loader = loader
         self.preview([paper("2609.00001")])
-        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send,                 self.assertLogs("digest_service", level="ERROR"):
+        with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send, \
+                self.assertLogs("digest_service", level="ERROR"):
             self.service.start("send", preview_id="preview-1")
             self.wait_job()
         state = self.store.read()
@@ -345,13 +379,28 @@ class AppCase(unittest.TestCase):
             long_paper["title"] = " ".join(f"word{index}" for index in range(200))
             papers.append(long_paper)
         self.preview(papers)
-        with patch.object(bot, "post_to_slack", side_effect=[{"ts": "123.1"}, RuntimeError("rate limited")]) as send,                 self.assertLogs("digest_service", level="ERROR"):
+        posted = []
+
+        def post(client, text, thread_ts=None, *, channel=None):
+            posted.append(thread_ts)
+            if len(posted) == 1:
+                return {"ts": "123.1"}
+            if thread_ts is None:
+                raise RuntimeError("rate limited")
+            return {"ts": "123.9"}
+
+        with patch.object(bot, "post_to_slack", side_effect=post), \
+                self.assertLogs("digest_service", level="ERROR"):
             self.service.start("send", preview_id="preview-1")
             self.wait_job()
-        self.assertEqual(send.call_count, 2)
+        # One parent, one failed continuation, then the thread under the parent anyway.
+        self.assertEqual(posted.count(None), 2)
+        self.assertIn("123.1", posted)
         state = self.store.read()
         self.assertEqual(state["job"]["status"], "partial")
         self.assertIn("title list", state["job"]["message"])
+        self.assertNotIn("some abstracts", state["job"]["message"])
+        self.assertTrue(state["last_message"]["abstracts_sent"])
         self.assertEqual(len(state["last_message"]["papers"]), len(papers))
         self.assertEqual(new_papers(state), [])
         # The retry cannot reach _send at all, so the parent is never posted twice.
@@ -385,7 +434,8 @@ class AppCase(unittest.TestCase):
             self.wait_job()
         self.assertEqual(self.store.read()["preview"]["id"], "preview-1")
 
-    def test_schedule_extends_retry_window_and_keeps_days_and_restart_guard(self):
+    def test_schedule_window_weekdays_dst_and_restart_guard(self):
+        self.assertEqual(str(self.service.timezone), "America/Los_Angeles")
         zone = self.service.timezone
         for date, clock, due in [("2026-09-06", "21:30", True), ("2026-09-07", "21:35", True),
                                  ("2026-09-10", "21:39", True), ("2026-09-11", "21:30", False),
@@ -400,10 +450,13 @@ class AppCase(unittest.TestCase):
         restarted = DigestService(StateStore(self.temp.name, ROOT), CONFIG)
         self.addCleanup(restarted.close)
         self.assertIsNone(restarted.due_slot(datetime.datetime(2026, 9, 8, 22, 30, tzinfo=zone)))
-        self.assertEqual(datetime.datetime(2026, 9, 8, 21, 30, tzinfo=zone).utcoffset().total_seconds(), -7 * 3600)
-        self.assertEqual(datetime.datetime(2026, 12, 8, 21, 30, tzinfo=zone).utcoffset().total_seconds(), -8 * 3600)
+        # The slot follows Pacific wall-clock time on both sides of the DST change.
+        for instant, due in (("2026-09-10T04:30:00+00:00", True), ("2026-12-10T05:30:00+00:00", True),
+                             ("2026-12-10T04:30:00+00:00", False)):
+            local = datetime.datetime.fromisoformat(instant).astimezone(self.service.timezone)
+            self.assertEqual(bool(self.service.due_slot(local)), due, instant)
 
-    def test_scheduled_timeout_can_recover_after_old_cutoff_without_duplicate_send(self):
+    def test_scheduled_timeout_recovers_later_in_window_without_duplicate_send(self):
         zone = self.service.timezone
         slot = self.service.due_slot(datetime.datetime(2026, 10, 6, 21, 30, tzinfo=zone))
         self.assertEqual(slot, "2026-10-06 21:30")
@@ -469,6 +522,234 @@ class AppCase(unittest.TestCase):
         self.assertEqual(page.count(b"Papers for 2026-09-08 through 2026-09-09"), 2)
         self.assertIn(b'name="date" value="2026-09-09"', page)
 
+    def test_scheduler_tick_queries_tomorrow_and_paces_retries(self):
+        zone = self.service.timezone
+        now = datetime.datetime(2026, 10, 6, 21, 30, tzinfo=zone)  # A Tuesday.
+        with patch.object(self.service, "start") as start:
+            retry_at = self.service.scheduler_tick(now, {})
+            start.assert_called_once_with("scheduled", target_date="2026-10-07", slot="2026-10-06 21:30")
+            later = now + datetime.timedelta(seconds=59)
+            self.assertEqual(self.service.scheduler_tick(later, retry_at), retry_at)
+            self.assertEqual(start.call_count, 1)
+            retry_at = self.service.scheduler_tick(now + datetime.timedelta(seconds=60), retry_at)
+            self.assertEqual(start.call_count, 2)
+            with self.service.lock:  # A job is still running, so the tick waits instead.
+                self.service.scheduler_tick(now + datetime.timedelta(seconds=180), retry_at)
+            self.assertEqual(start.call_count, 2)
+            self.service.scheduler_tick(datetime.datetime(2026, 10, 9, 21, 30, tzinfo=zone), {})  # Friday.
+            self.assertEqual(start.call_count, 2)
+
+    def test_scheduler_loop_survives_errors_and_terminates_the_process_if_it_dies(self):
+        class LoopDied(BaseException):
+            pass
+
+        ticks, killed = [], threading.Event()
+
+        def tick(now, retry_at):
+            ticks.append(now)
+            if len(ticks) == 1:
+                raise RuntimeError("one bad iteration")
+            raise LoopDied()
+
+        with patch.object(self.service, "scheduler_tick", side_effect=tick), \
+                patch("digest_service.os.kill", side_effect=lambda pid, sig: killed.set()) as kill, \
+                patch("threading.excepthook"), \
+                self.assertLogs("digest_service", level="ERROR") as logs:
+            self.service.start_scheduler(poll_seconds=0.01)
+            self.assertTrue(killed.wait(5))
+            self.service.scheduler.join(5)
+        self.assertEqual(len(ticks), 2)
+        self.assertEqual(ticks[0].tzinfo, self.service.timezone)
+        kill.assert_called_once_with(os.getpid(), signal.SIGTERM)
+        self.assertTrue(any("Scheduler iteration failed" in line for line in logs.output))
+        self.assertTrue(any("terminating for restart" in line for line in logs.output))
+
+    def test_healthz_returns_503_when_the_enabled_scheduler_is_dead_or_stalled(self):
+        with patch.object(DigestService, "start_scheduler"), contextlib.redirect_stdout(io.StringIO()):
+            app = create_app(data_dir=self.temp.name, config=CONFIG, start_scheduler=True)
+        service = app.extensions["digest_service"]
+        self.addCleanup(service.close)
+        client = app.test_client()
+        self.assertIn(b"Daily delivery", client.get("/").data)
+        response = client.get("/healthz")
+        self.assertEqual((response.status_code, response.json), (503, {"status": "scheduler stopped"}))
+        service.scheduler = Mock(is_alive=Mock(return_value=True))
+        service.last_tick = time.monotonic()
+        self.assertEqual(client.get("/healthz").status_code, 200)
+        service.last_tick = time.monotonic() - 121
+        self.assertEqual(client.get("/healthz").status_code, 503)
+        service.scheduler = None
+
+    def test_failed_logins_on_a_shared_address_cannot_lock_out_a_known_admin_browser(self):
+        self.login()
+        self.assertIsNotNone(self.client.get_cookie(DEVICE_COOKIE, path="/login"))
+        self.post("/logout")
+        # The test client always connects from 127.0.0.1, like every LAN client
+        # behind Docker Desktop's port forwarding.
+        attacker = self.app.test_client()
+        wrong = {"username": "admin", "password": "wrong"}
+        for _ in range(10):
+            self.assertEqual(self.post("/login", wrong, client=attacker).status_code, 200)
+        self.assertEqual(self.post("/login", wrong, client=attacker).status_code, 429)
+        self.login()  # The admin's browser still has its own allowance.
+        right = {"username": "admin", "password": "test-password"}
+        self.assertEqual(self.post("/login", right, client=self.app.test_client()).status_code, 429)
+        forged = self.app.test_client()
+        forged.set_cookie(DEVICE_COOKIE, "forged", path="/login")
+        self.assertEqual(self.post("/login", right, client=forged).status_code, 429)
+
+    def test_successful_logins_do_not_use_up_the_login_allowance(self):
+        right = {"username": "admin", "password": "test-password"}
+        for _ in range(12):
+            self.assertEqual(self.post("/login", right, client=self.app.test_client()).status_code, 302)
+
+    def test_suggestion_allowance_is_per_browser_on_a_shared_address(self):
+        for number in range(20):
+            self.assertEqual(self.post("/suggest", {"kind": "keywords", "value": f"term {number}"}).status_code, 302)
+        self.assertEqual(self.post("/suggest", {"kind": "keywords", "value": "term 20"}).status_code, 429)
+        neighbour = self.app.test_client()
+        self.assertEqual(self.post("/suggest", {"kind": "keywords", "value": "neighbour term"}, client=neighbour).status_code, 302)
+
+    def test_forwarded_addresses_are_trusted_only_when_configured(self):
+        for hops, expected in (("0", "127.0.0.1"), ("1", "203.0.113.7")):
+            with patch.dict(os.environ, {"TRUSTED_PROXY_HOPS": hops}), contextlib.redirect_stdout(io.StringIO()):
+                app = create_app(data_dir=self.temp.name, config=CONFIG)
+            self.addCleanup(app.extensions["digest_service"].close)
+            app.add_url_rule("/whoami", "whoami", lambda: request.remote_addr)
+            response = app.test_client().get("/whoami", headers={"X-Forwarded-For": "203.0.113.7"})
+            self.assertEqual(response.text, expected, hops)
+
+    def test_a_slack_failure_retry_reuses_the_fetched_papers_across_a_restart(self):
+        slot = "2026-10-06 21:30"
+        payload = {"date_str": "2026-10-07", "papers": [paper("2610.00001")]}
+        with patch.object(bot, "build_daily_payload", return_value=payload) as build:
+            with patch.object(bot, "post_to_slack", side_effect=RuntimeError("invalid_auth")), \
+                    self.assertLogs("digest_service", level="ERROR"):
+                self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+                self.wait_job()
+            preview_id = self.store.read()["preview"]["id"]
+            restarted = DigestService(StateStore(self.temp.name, ROOT), CONFIG)
+            self.addCleanup(restarted.close)
+            with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}) as send:
+                restarted.start("scheduled", target_date="2026-10-07", slot=slot)
+                restarted.worker.join(timeout=10)
+        self.assertEqual(build.call_count, 1)
+        state = self.store.read()
+        self.assertEqual(state["preview"]["id"], preview_id)
+        self.assertEqual(state["job"]["status"], "success")
+        self.assertEqual(send.call_count, 2)
+        self.assertIn(slot, state["schedule_slots"])
+
+    def test_a_retry_fetches_again_when_the_watchlists_changed(self):
+        slot = "2026-10-06 21:30"
+        payload = {"date_str": "2026-10-07", "papers": [paper("2610.00001")]}
+        with patch.object(bot, "build_daily_payload", return_value=payload) as build:
+            with patch.object(bot, "post_to_slack", side_effect=RuntimeError("offline")), \
+                    self.assertLogs("digest_service", level="ERROR"):
+                self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+                self.wait_job()
+            self.store.update(lambda state: state["authors"].append("Grace Hopper"))
+            with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}):
+                self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+                self.wait_job()
+        self.assertEqual(build.call_count, 2)
+        self.assertIn("Grace Hopper", build.call_args.kwargs["watchlists"][0])
+        self.assertEqual(self.store.read()["job"]["status"], "success")
+
+    def test_a_normal_close_stops_the_scheduler_without_killing_the_process(self):
+        with patch.object(self.service, "scheduler_tick", side_effect=lambda now, retry_at: retry_at), \
+                patch("digest_service.os.kill") as kill:
+            self.service.start_scheduler(poll_seconds=0.01)
+            self.service.close()
+        self.assertFalse(self.service.scheduler.is_alive())
+        kill.assert_not_called()
+
+    def test_main_closes_the_service_when_sigterm_arrives(self):
+        handlers, service = {}, Mock()
+
+        def serve(*args, **kwargs):
+            handlers[signal.SIGTERM](signal.SIGTERM, None)  # What the OS delivers on docker stop.
+
+        with patch.object(web_app, "create_app", return_value=Mock(extensions={"digest_service": service})) as create, \
+                patch.object(web_app, "serve", side_effect=serve) as served, \
+                patch.object(web_app.signal, "signal", side_effect=lambda sig, handler: handlers.__setitem__(sig, handler)), \
+                patch.object(web_app.logging, "basicConfig"), \
+                patch.object(sys, "argv", ["web_app.py"]):
+            with self.assertRaises(SystemExit) as stopped:
+                web_app.main()
+        self.assertEqual(stopped.exception.code, 0)
+        service.close.assert_called_once_with()
+        create.assert_called_once_with(start_scheduler=True)
+        self.assertEqual(served.call_args.kwargs["port"], 8765)
+
+    def test_a_known_admin_browser_is_itself_limited_after_failed_logins(self):
+        self.login()
+        self.post("/logout")
+        wrong = {"username": "admin", "password": "wrong"}
+        for _ in range(10):
+            self.assertEqual(self.post("/login", wrong).status_code, 200)
+        self.assertEqual(self.post("/login", wrong).status_code, 429)
+        # Its bucket is its own: another browser on the address is unaffected.
+        self.assertEqual(self.post("/login", wrong, client=self.app.test_client()).status_code, 200)
+
+    def test_known_browsers_keep_their_allowance_after_a_password_reset(self):
+        self.login()
+        self.post("/logout")
+        password = self.store.reset_password()
+        with contextlib.redirect_stdout(io.StringIO()):
+            restarted = create_app(data_dir=self.temp.name, config=CONFIG)  # The documented restart.
+        self.addCleanup(restarted.extensions["digest_service"].close)
+        admin = restarted.test_client()
+        admin.set_cookie(DEVICE_COOKIE, self.client.get_cookie(DEVICE_COOKIE, path="/login").value, path="/login")
+        attacker = restarted.test_client()
+        wrong = {"username": "admin", "password": "wrong"}
+        for _ in range(10):
+            self.post("/login", wrong, client=attacker)
+        self.assertEqual(self.post("/login", wrong, client=attacker).status_code, 429)
+        self.assertEqual(self.post("/login", {"username": "admin", "password": password}, client=admin).status_code, 302)
+
+    def test_volumes_without_a_device_secret_get_one(self):
+        self.store.update(lambda state: state.pop("device_secret"))
+        self.assertTrue(StateStore(self.temp.name, ROOT).read()["device_secret"])
+
+    def test_a_full_login_table_cannot_lock_out_a_known_admin_browser(self):
+        self.login()
+        self.post("/logout")
+        logins = self.app.extensions["rate_limiters"]["login"]
+        for number in range(RateLimiter.MAX_KEYS):
+            logins.allow((("login", f"forged-{number}"), 10, 900))
+        right = {"username": "admin", "password": "test-password"}
+        self.assertEqual(self.post("/login", right, client=self.app.test_client()).status_code, 429)
+        self.login()
+
+    def test_the_per_address_suggestion_cap_holds_against_fresh_sessions(self):
+        statuses = [self.post("/suggest", {"kind": "keywords", "value": f"flood {number}"},
+                              client=self.app.test_client()).status_code
+                    for number in range(SUGGEST_ADDRESS_LIMIT + 1)]
+        self.assertEqual(statuses.count(302), SUGGEST_ADDRESS_LIMIT)
+        self.assertEqual(statuses[-1], 429)
+        # The flood leaves logins alone; they use a separate table.
+        right = {"username": "admin", "password": "test-password"}
+        self.assertEqual(self.post("/login", right, client=self.app.test_client()).status_code, 302)
+
+    def test_a_retry_fetches_again_when_the_categories_changed(self):
+        # Only the categories differ, so the fingerprint must cover them on their own.
+        configs = iter([{**CONFIG, "categories": ["physics"], "subcat": [[]]},
+                        {**CONFIG, "categories": ["quant-ph"], "subcat": [[]]}])
+        self.service.config_loader = lambda: next(configs)
+        slot = "2026-10-06 21:30"
+        payload = {"date_str": "2026-10-07", "papers": [paper("2610.00001")]}
+        with patch.object(bot, "build_daily_payload", return_value=payload) as build:
+            with patch.object(bot, "post_to_slack", side_effect=RuntimeError("offline")), \
+                    self.assertLogs("digest_service", level="ERROR"):
+                self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+                self.wait_job()
+            with patch.object(bot, "post_to_slack", return_value={"ts": "123.1"}):
+                self.service.start("scheduled", target_date="2026-10-07", slot=slot)
+                self.wait_job()
+        self.assertEqual(build.call_count, 2)
+        self.assertEqual(build.call_args.kwargs["config"]["categories"], ["quant-ph"])
+
 
 class CoreTests(unittest.TestCase):
     def test_blank_lines_and_multiword_names(self):
@@ -511,6 +792,58 @@ class CoreTests(unittest.TestCase):
             scraper.return_value.scrape.return_value = None
             with self.assertRaises(RuntimeError):
                 bot.fetch_papers_for_date("2026-09-09", config=config)
+
+    def test_slack_text_escapes_markup_characters(self):
+        papers = [{"id": "2609.00001", "title": "Cooling to T<1 nK & N>10^4 atoms",
+                   "abstract": "We reach <!channel> densities & more.", "authors": ["Ada <Lovelace>"],
+                   "selection": "author", "selected_for": "Ada <Lovelace>"}]
+        payload = bot.payload_from_papers("2026-09-09", papers)
+        for text in (payload["msg_text"], payload["thread_text"]):
+            self.assertNotRegex(text, "[<>]")
+            self.assertNotRegex(text, "&(?!amp;|lt;|gt;)")
+        self.assertIn("*Title:* Cooling to T&lt;1 nK &amp; N&gt;10^4 atoms", payload["msg_text"])
+        self.assertIn("*Selected for:* Ada &lt;Lovelace&gt;", payload["msg_text"])
+        self.assertIn("*Abstract:* We reach &lt;!channel&gt; densities &amp; more.", payload["thread_text"])
+
+    def test_chunks_never_split_an_escaped_character(self):
+        text = "x" * 34998 + "&amp;" + "y" * 10
+        self.assertEqual(list(slack_chunks(text)), ["x" * 34998, "&amp;" + "y" * 10])
+
+    def test_chunks_prefer_spaces_when_a_line_is_too_long(self):
+        text = "word " * 10000
+        chunks = list(slack_chunks(text))
+        self.assertGreater(len(chunks), 1)
+        self.assertTrue(all(len(chunk) <= 35000 for chunk in chunks))
+        self.assertFalse(any(chunk.startswith(" ") for chunk in chunks))
+        self.assertEqual(" ".join(chunks).split(), text.split())
+
+    def test_original_capitalization_reaches_slack_unchanged(self):
+        papers = [{"id": "2609.00001", "title": "Quantum DNA and BEC in SU(N)",
+                   "abstract": "We use e.g. lasers at 3.5 times arXiv.org rates. Then we stop.",
+                   "authors": ["Yann LeCun", "Jean-Philippe Brantut", "Sylvain de L\u00e9s\u00e9leuc"],
+                   "selection": "keyword", "selected_for": ""}]
+        payload = bot.payload_from_papers("2026-09-09", papers)
+        self.assertIn("*Title:* Quantum DNA and BEC in SU(N)", payload["msg_text"])
+        self.assertIn("*Authors:* Yann LeCun, Jean-Philippe Brantut, Sylvain de L\u00e9s\u00e9leuc", payload["msg_text"])
+        self.assertIn("*Abstract:* We use e.g. lasers at 3.5 times arXiv.org rates. Then we stop.", payload["thread_text"])
+
+    def test_lowercased_legacy_text_is_still_restored(self):
+        papers = [{"id": "2609.00001", "title": "quantum dna",
+                   "abstract": "we trap atoms (see fig. 1.) then cool them to 3.5 k. done!",
+                   "authors": ["ada lovelace"], "selection": "keyword", "selected_for": ""}]
+        payload = bot.payload_from_papers("2026-09-09", papers)
+        self.assertIn("*Title:* Quantum dna", payload["msg_text"])
+        self.assertIn("*Authors:* Ada Lovelace", payload["msg_text"])
+        self.assertIn("*Abstract:* We trap atoms (see fig. 1.) Then cool them to 3.5 k. Done!", payload["thread_text"])
+
+    def test_a_parenthetical_only_watchlist_line_is_skipped_not_fatal(self):
+        with self.assertLogs("slackbot_daily_arxiv", level="WARNING"):
+            watchlists = bot.load_watchlists(["(Google)", "Ada Lovelace (Lab)", "  "], [])
+        self.assertEqual(watchlists[0], ["Ada Lovelace (Lab)"])
+        self.assertEqual(watchlists[4], ["lovelace"])
+        frame = pd.DataFrame([{"id": "1", "title": "T", "authors": ["Ada Lovelace"], "abstract": "A"}])
+        which_authors = bot.classify_papers(frame, watchlists[0], watchlists[3], watchlists[4], watchlists[5])[3]
+        self.assertEqual(which_authors, ["Ada Lovelace (Lab), "])
 
 
 if __name__ == "__main__":

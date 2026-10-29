@@ -8,7 +8,8 @@ this after editing the SVG, then commit both files:
     python scripts/make_favicon_ico.py
 
 Development-only: it needs playwright, which the application never imports and
-which is not in requirements.txt.
+which is not in requirements.txt, and it renders with the installed Microsoft
+Edge (channel="msedge").
 """
 
 import struct

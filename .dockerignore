@@ -3,7 +3,7 @@
 **
 !requirements.txt
 !slackbot_daily_arxiv.py
-!bot_server.py
+!schedule_config.py
 !web_app.py
 !web_state.py
 !digest_service.py

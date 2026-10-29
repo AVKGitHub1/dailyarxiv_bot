@@ -1,3 +1,5 @@
+"""Archived pre-Docker host scheduler. The container owns Slack delivery; see archive/README.md."""
+
 import datetime
 import logging
 import os
@@ -11,7 +13,8 @@ RETRY_DELAY_SECONDS = 60
 SECONDS_PER_DAY = 24 * 60 * 60
 ALLOWED_WEEKDAYS = {6, 0, 1, 2, 3}  # Sunday(6) through Thursday(3)
 
-# setup logging with date and time in the format YYYY-MM-DD HH:MM:SS
+# Timestamped logs (asctime renders as YYYY-MM-DD HH:MM:SS,mmm). Importing
+# slackbot_daily_arxiv above already configures the root logger the same way.
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
@@ -137,11 +140,11 @@ def run_scheduler():
 
 
 if __name__ == "__main__":
-    # Pre-Docker entry point. web_app.py owns Slack delivery now; running both
-    # posts two digests a night to the same channel.
+    # Archived pre-Docker entry point. The container owns Slack delivery now;
+    # running both posts two digests a night to the same channel.
     if os.environ.get("ARXIV_LEGACY_SCHEDULER") != "1":
         raise SystemExit(
-            "bot_server.py is the pre-Docker scheduler. The container (web_app.py) now owns "
+            "archive/bot_server.py is the archived pre-Docker scheduler. The container now owns "
             "Slack delivery; running both double-posts to the same channel. "
             "Set ARXIV_LEGACY_SCHEDULER=1 to override."
         )

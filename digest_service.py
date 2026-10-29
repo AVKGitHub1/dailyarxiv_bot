@@ -1,6 +1,8 @@
 """Serialized background jobs; previewing never posts to Slack."""
 
 import datetime
+import hashlib
+import json
 import logging
 import os
 import re
@@ -10,7 +12,7 @@ import threading
 import time
 from zoneinfo import ZoneInfo
 
-import bot_server
+import schedule_config as schedule
 import slackbot_daily_arxiv as bot
 from web_state import timestamp
 
@@ -30,11 +32,30 @@ def new_papers(state):
 def slack_chunks(text, limit=35000):
     """Stay below Slack's 40,000-character truncation limit, including long abstracts."""
     while text:
-        end = len(text) if len(text) <= limit else text.rfind("\n", 0, limit)
-        if end <= 0:
-            end = limit
+        if len(text) <= limit:
+            end = len(text)
+        else:
+            end = text.rfind("\n", 0, limit)
+            if end <= 0:
+                end = text.rfind(" ", 0, limit)
+            if end <= 0:
+                end = limit
+                # Never split an escaped "&amp;", "&lt;" or "&gt;" across two messages.
+                entity = text.rfind("&", max(0, end - 4), end)
+                if entity > 0 and ";" not in text[entity:end]:
+                    end = entity
         yield text[:end]
-        text = text[end:].lstrip("\n")
+        text = text[end:].lstrip("\n ")
+
+
+def fetch_fingerprint(config, watchlists, target_date, date_from):
+    """Everything a fetch depends on, so a retry can tell whether an earlier fetch still applies."""
+    material = json.dumps({
+        "categories": config.get("categories"), "subcat": config.get("subcat"), "cols": config.get("cols"),
+        "authors": list(watchlists[0]), "keywords": list(watchlists[1]),
+        "date": target_date, "date_from": date_from,
+    }, sort_keys=True, default=str)
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 
 
 class DigestService:
@@ -115,7 +136,7 @@ class DigestService:
         try:
             self._reload_config()
             if action != "send":
-                self._regenerate(target_date, scheduled=action == "scheduled")
+                self._regenerate(target_date, scheduled=action == "scheduled", slot=slot)
             if action != "regenerate":
                 self._send(action, slot)
             else:
@@ -127,20 +148,31 @@ class DigestService:
         finally:
             self.lock.release()
 
-    def _regenerate(self, target_date, *, scheduled=False):
+    def _regenerate(self, target_date, *, scheduled=False, slot=None):
         state = self.store.read()
         date_from = target_date
         if scheduled and state["scheduled_empty_since"]:
             date_from = min(date_from, state["scheduled_empty_since"])
+        watchlists = (state["authors"], state["keywords"])
+        fingerprint = fetch_fingerprint(self.config, watchlists, target_date, date_from)
+        previous = state["preview"]
+        if slot and previous and previous.get("slot") == slot and previous.get("fingerprint") == fingerprint:
+            # An earlier attempt at this slot fetched these papers and then failed
+            # at Slack. Retry delivery without harvesting arXiv again.
+            logger.info("Reusing the papers fetched earlier for slot %s", slot)
+            self.store.update(lambda state: state["job"].update(
+                message="Retrying Slack delivery with the papers fetched earlier…"))
+            return
         payload = bot.build_daily_payload(
-            config=self.config, target_date=target_date, date_from=date_from,
-            watchlists=(state["authors"], state["keywords"]),
+            config=self.config, target_date=target_date, date_from=date_from, watchlists=watchlists,
         )
         preview = {
             "id": secrets.token_hex(12), "date": payload["date_str"],
             "date_from": date_from,
             "generated_at": timestamp(), "papers": payload["papers"],
+            "slot": slot, "fingerprint": fingerprint,
         }
+
         def record_preview(state):
             state["preview"] = preview
             if scheduled and not preview["papers"]:
@@ -158,7 +190,8 @@ class DigestService:
             state["scheduled_empty_since"] = None
         if slot:
             state["schedule_slots"][slot] = timestamp()
-            # Keep a month of persistent restart guards.
+            # Keep the 150 most recent slots (about seven months at one slot per
+            # scheduled weekday) as persistent restart guards.
             state["schedule_slots"] = dict(sorted(state["schedule_slots"].items())[-150:])
 
     def _client(self):
@@ -167,6 +200,7 @@ class DigestService:
     def _send(self, action, slot):
         state = self.store.read()
         papers = new_papers(state)
+        channel = self.config["channel"]
         if not papers:
             if action != "scheduled":
                 self.store.update(lambda state: self._complete_slot(state, slot))
@@ -191,7 +225,7 @@ class DigestService:
             else:
                 notice = bot.payload_from_papers(preview["date"], [], date_from=preview.get("date_from"))["msg_text"]
                 message = "No new papers. Posted the daily notice to Slack."
-            bot.post_to_slack(self._client(), notice, channel=self.config["channel"])
+            bot.post_to_slack(self._client(), notice, channel=channel)
             self.store.update(lambda state: self._complete_slot(state, slot, action=action))
             self._finish("success", message)
             return
@@ -201,7 +235,7 @@ class DigestService:
         # The first chunk anchors the abstract thread; continuations post at the
         # top level so the title list stays scannable in-channel.
         parent_chunks = list(slack_chunks(payload["msg_text"])) or [payload["msg_text"]]
-        response = bot.post_to_slack(client, parent_chunks[0], channel=self.config["channel"])
+        response = bot.post_to_slack(client, parent_chunks[0], channel=channel)
         if not response or not response.get("ts"):
             raise RuntimeError("Slack did not confirm delivery.")
         last_message = {
@@ -215,42 +249,56 @@ class DigestService:
             state["baseline_ids"] = [paper_key(paper) for paper in preview["papers"]]
             self._complete_slot(state, slot, action=action)
 
-        # Record the parent before posting the abstract thread. A thread error
-        # must never cause a retry to post the same parent again.
+        # Record the parent before posting anything else. A later error must
+        # never cause a retry to post the same parent again.
         self.store.update(record_delivery)
+        missing = []
         try:
             for chunk in parent_chunks[1:]:
-                bot.post_to_slack(client, chunk, channel=self.config["channel"])
+                bot.post_to_slack(client, chunk, channel=channel)
         except Exception:
             logger.exception("Digest delivered, but its continuation messages failed")
-            self._finish("partial", f"Sent {len(papers)} papers, but part of the title list did not reach Slack. The full list is available here.")
-            return
+            missing.append("part of the title list")
+        # The thread hangs off the first message, so it is still worth posting
+        # when a continuation failed.
         try:
             for chunk in slack_chunks(payload["thread_text"] or ""):
-                bot.post_to_slack(client, chunk, thread_ts=response["ts"], channel=self.config["channel"])
+                bot.post_to_slack(client, chunk, thread_ts=response["ts"], channel=channel)
         except Exception:
             logger.exception("Digest delivered, but its abstract thread failed")
-            self._finish("partial", f"Sent {len(papers)} papers. Some abstracts could not be posted to the Slack thread; they are available here.")
+            missing.append("some abstracts in the thread")
+        else:
+            self.store.update(lambda state: state["last_message"].update(abstracts_sent=True))
+        if missing:
+            self._finish("partial", f"Sent {len(papers)} papers, but {' and '.join(missing)} did not reach Slack. "
+                                    "The full list and abstracts are available here.")
             return
-        self.store.update(lambda state: state["last_message"].update(abstracts_sent=True))
         self._finish("success", f"Sent {len(papers)} new papers to Slack.")
 
     def due_slot(self, now):
-        if now.weekday() not in bot_server.ALLOWED_WEEKDAYS:
+        if now.weekday() not in schedule.ALLOWED_WEEKDAYS:
             return None
-        current = bot_server.seconds_since_midnight(now)
+        current = schedule.seconds_since_midnight(now)
         completed = self.store.read()["schedule_slots"]
-        for label, seconds in zip(bot_server.TIMES, bot_server.SCHEDULE_SECONDS):
+        for label, seconds in zip(schedule.TIMES, schedule.SCHEDULE_SECONDS):
             slot = f"{now.date().isoformat()} {label}"
-            if seconds <= current < min(86400, seconds + bot_server.SEND_WINDOW_SECONDS) and slot not in completed:
+            if seconds <= current < min(schedule.SECONDS_PER_DAY, seconds + schedule.SEND_WINDOW_SECONDS) and slot not in completed:
                 return slot
         return None
+
+    def scheduler_tick(self, now, retry_at):
+        """Start the due slot unless it is waiting out its retry delay; return the updated retry times."""
+        slot = self.due_slot(now)
+        if slot and now.timestamp() >= retry_at.get(slot, 0) and not self.lock.locked():
+            self.start("scheduled", target_date=(now.date() + datetime.timedelta(days=1)).isoformat(), slot=slot)
+            return {slot: now.timestamp() + schedule.RETRY_DELAY_SECONDS}
+        return retry_at
 
     def scheduler_healthy(self):
         return bool(self.scheduler and self.scheduler.is_alive()
                     and time.monotonic() - self.last_tick < 120)
 
-    def start_scheduler(self):
+    def start_scheduler(self, poll_seconds=5):
         def loop():
             retry_at = {}
             try:
@@ -259,14 +307,10 @@ class DigestService:
                     # timestamp means the loop itself stalled.
                     self.last_tick = time.monotonic()
                     try:
-                        now = datetime.datetime.now(self.timezone)
-                        slot = self.due_slot(now)
-                        if slot and now.timestamp() >= retry_at.get(slot, 0) and not self.lock.locked():
-                            self.start("scheduled", target_date=(now.date() + datetime.timedelta(days=1)).isoformat(), slot=slot)
-                            retry_at = {slot: now.timestamp() + bot_server.RETRY_DELAY_SECONDS}
+                        retry_at = self.scheduler_tick(datetime.datetime.now(self.timezone), retry_at)
                     except Exception:
                         logger.exception("Scheduler iteration failed")
-                    self.stop_event.wait(5)
+                    self.stop_event.wait(poll_seconds)
             finally:
                 if not self.stop_event.is_set():
                     # A dead scheduler with a live web server is invisible in Slack.

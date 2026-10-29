@@ -13,31 +13,63 @@ from functools import wraps
 from pathlib import Path
 
 from flask import Flask, abort, flash, jsonify, redirect, render_template, request, session, url_for
+from itsdangerous import BadSignature, URLSafeTimedSerializer
 from waitress import serve
+from werkzeug.middleware.proxy_fix import ProxyFix
 from werkzeug.security import check_password_hash
 
-import bot_server
+import schedule_config as schedule
 import slackbot_daily_arxiv as bot
 from digest_service import DigestService, new_papers
 from web_state import StateStore
 
 BASE_DIR = Path(__file__).resolve().parent
 
+LOGIN_LIMIT = 10  # Failed attempts per 15 minutes, per known browser or per address.
+LOGIN_WINDOW = 15 * 60
+SUGGEST_LIMIT = 20  # Suggestions per hour, per browser.
+SUGGEST_ADDRESS_LIMIT = 60  # Suggestions per hour, per address: the bound a scripted client cannot reset.
+DEVICE_COOKIE = "arxiv_admin_device"
+DEVICE_MAX_AGE = 180 * 24 * 60 * 60
+
 
 class RateLimiter:
+    """In-memory fixed-window counters, bounded to MAX_KEYS live keys."""
+
+    MAX_KEYS = 4096
+
     def __init__(self):
         self.entries = {}
         self.lock = threading.Lock()
 
-    def allow(self, key, limit, window):
+    def allow(self, *rules, bounded=True):
+        """Count one attempt against every (key, limit, window) rule, or against none if any is used up.
+
+        bounded=False admits a new key even when the table is full. Use it only for keys a
+        client cannot mint at will, so a flood of other keys cannot crowd them out.
+        """
         now = time.monotonic()
         with self.lock:
             self.entries = {key: value for key, value in self.entries.items() if value[0] > now}
-            expiry, count = self.entries.get(key, (now + window, 0))
-            if count >= limit or (key not in self.entries and len(self.entries) >= 4096):
+            new_keys = sum(1 for key, _limit, _window in rules if key not in self.entries)
+            if bounded and new_keys and len(self.entries) + new_keys > self.MAX_KEYS:
                 return False
-            self.entries[key] = (expiry, count + 1)
+            if any(self.entries.get(key, (0, 0))[1] >= limit for key, limit, _window in rules):
+                return False
+            for key, _limit, window in rules:
+                expiry, count = self.entries.get(key, (now + window, 0))
+                self.entries[key] = (expiry, count + 1)
             return True
+
+    def refund(self, key):
+        """Give back an attempt that turned out to be legitimate."""
+        with self.lock:
+            if key in self.entries:
+                expiry, count = self.entries[key]
+                if count <= 1:
+                    del self.entries[key]
+                else:
+                    self.entries[key] = (expiry, count - 1)
 
 
 def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=False):
@@ -54,10 +86,20 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
         SESSION_COOKIE_SECURE=os.environ.get("COOKIE_SECURE", "0") == "1",
         PERMANENT_SESSION_LIFETIME=datetime.timedelta(hours=8),
     )
+    proxy_hops = int(os.environ.get("TRUSTED_PROXY_HOPS", "0"))
+    if proxy_hops > 0:
+        # Only when the proxy is the sole route to this port (see ARXIV_BIND in
+        # compose.yaml); a client reaching the app directly could forge X-Forwarded-For.
+        app.wsgi_app = ProxyFix(app.wsgi_app, x_for=proxy_hops, x_proto=proxy_hops)
     service = DigestService(store, config, os.environ.get("TZ", "America/Los_Angeles"), config_loader=config_loader)
     app.extensions["store"] = store
     app.extensions["digest_service"] = service
-    limiter = RateLimiter()
+    # Separate tables, so a suggestion flood can never fill the one logins use.
+    login_limiter, suggest_limiter = RateLimiter(), RateLimiter()
+    app.extensions["rate_limiters"] = {"login": login_limiter, "suggest": suggest_limiter}
+    # Device cookies grant no privilege, only a login allowance, so they use their own
+    # secret: a password reset must not drop every known browser into the shared bucket.
+    device_signer = URLSafeTimedSerializer(store.read()["device_secret"], salt="daily-arxiv-admin-device")
 
     if store.initial_password:
         print("\nDaily arXiv — first launch\nAdmin username: admin\n"
@@ -72,6 +114,16 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
                 abort(403, "Sign in as admin to perform this action.")
             return view(*args, **kwargs)
         return wrapped
+
+    def trusted_device():
+        """The id of a browser that has signed in as admin before, if its cookie is genuine."""
+        token = request.cookies.get(DEVICE_COOKIE)
+        if not token:
+            return None
+        try:
+            return device_signer.loads(token, max_age=DEVICE_MAX_AGE)
+        except BadSignature:
+            return None
 
     @app.before_request
     def csrf_protection():
@@ -88,7 +140,7 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
         return {
             "csrf_token": session["csrf_token"],
             "is_admin": bool(session.get("admin")),
-            "schedule": ", ".join(bot_server.TIMES),
+            "schedule": ", ".join(schedule.TIMES),
             "timezone_name": str(service.timezone),
             "scheduler_enabled": start_scheduler,
         }
@@ -129,14 +181,27 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
     @app.route("/login", methods=["GET", "POST"])
     def login():
         if request.method == "POST":
-            if not limiter.allow(("login", request.remote_addr), 10, 15 * 60):
+            # Behind Docker Desktop's port forwarding or a proxy, every client can
+            # share one address. A browser that has signed in before keeps its own
+            # allowance, so failed guesses from elsewhere cannot lock the admin out.
+            # A first sign-in from a new browser still shares the per-address allowance.
+            device = trusted_device()
+            key = ("login-device", device) if device else ("login", request.remote_addr)
+            if not login_limiter.allow((key, LOGIN_LIMIT, LOGIN_WINDOW), bounded=device is None):
                 abort(429, "Too many login attempts. Please wait 15 minutes.")
             valid_password = check_password_hash(store.read()["password_hash"], request.form.get("password", ""))
             if request.form.get("username") == "admin" and valid_password:
+                login_limiter.refund(key)  # Only failed attempts count.
                 session.clear()
                 session["admin"] = True
                 session.permanent = True
-                return redirect(url_for("index"))
+                response = redirect(url_for("index"))
+                response.set_cookie(
+                    DEVICE_COOKIE, device_signer.dumps(device or secrets.token_urlsafe(16)),
+                    max_age=DEVICE_MAX_AGE, path=url_for("login"), httponly=True, samesite="Lax",
+                    secure=app.config["SESSION_COOKIE_SECURE"],
+                )
+                return response
             flash("Incorrect username or password.", "error")
         return render_template("login.html")
 
@@ -147,7 +212,10 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
 
     @app.post("/suggest")
     def suggest():
-        if not limiter.allow(("suggest", request.remote_addr), 20, 60 * 60):
+        # Per browser, so people sharing one address do not use up each other's
+        # allowance; the looser per-address cap still bounds a flood.
+        if not suggest_limiter.allow((("suggest", session["csrf_token"]), SUGGEST_LIMIT, 60 * 60),
+                                     (("suggest-address", request.remote_addr), SUGGEST_ADDRESS_LIMIT, 60 * 60)):
             abort(429, "Too many suggestions. Please try again in an hour.")
         try:
             store.suggest(request.form.get("kind"), request.form.get("value", ""))
@@ -203,9 +271,10 @@ def create_app(*, data_dir=None, config=None, seed_dir=None, start_scheduler=Fal
             return jsonify(status="scheduler stopped"), 503
         return jsonify(status="ok")
 
+    def error_page(error):
+        return render_template("error.html", error=error), error.code
+
     for code in (400, 403, 404, 413, 429, 500):
-        def error_page(error):
-            return render_template("error.html", error=error), error.code
         app.register_error_handler(code, error_page)
 
     if start_scheduler:
@@ -221,7 +290,7 @@ def main():
         store = StateStore(os.environ.get("ARXIV_DATA_DIR", BASE_DIR / "data"), BASE_DIR)
         print(f"Admin username: admin\nNew admin password: {store.reset_password()}\nRestart the web service to invalidate existing sessions.", flush=True)
         return
-    logging.basicConfig(level=logging.INFO)
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
     app = create_app(start_scheduler=os.environ.get("SCHEDULER_ENABLED", "1") == "1")
 
     def shutdown(signum, frame):
